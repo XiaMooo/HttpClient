@@ -1,0 +1,4 @@
+build/
+build-*/
+.cache/
+tools/go_compare/.cache/

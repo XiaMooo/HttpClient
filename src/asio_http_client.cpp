@@ -1,0 +1,1200 @@
+#include "httpclient/asio_http_client.hpp"
+
+#include <boost/asio/as_tuple.hpp>
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/ssl/context.hpp>
+#include <boost/asio/ssl/stream.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/this_coro.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/system/error_code.hpp>
+#include <openssl/ssl.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cstring>
+#include <deque>
+#include <functional>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <sstream>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+
+namespace httpclient {
+namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+using tcp = asio::ip::tcp;
+
+namespace {
+
+std::runtime_error stage_error(std::string_view stage, const std::exception& e) {
+  std::ostringstream oss;
+  oss << stage << ": " << e.what();
+  return std::runtime_error(oss.str());
+}
+
+struct ParsedUrl {
+  std::string scheme;
+  std::string host;
+  std::string port;
+  std::string target;
+  bool tls = false;
+};
+
+ParsedUrl parse_url(const std::string& url) {
+  auto scheme_end = url.find("://");
+  if (scheme_end == std::string::npos) {
+    throw std::invalid_argument("url must include scheme");
+  }
+
+  ParsedUrl out;
+  out.scheme = url.substr(0, scheme_end);
+  out.tls = out.scheme == "https";
+  if (!out.tls && out.scheme != "http") {
+    throw std::invalid_argument("only http and https are supported");
+  }
+
+  auto rest_start = scheme_end + 3;
+  auto path_start = url.find('/', rest_start);
+  std::string authority =
+      path_start == std::string::npos ? url.substr(rest_start)
+                                      : url.substr(rest_start, path_start - rest_start);
+  out.target = path_start == std::string::npos ? "/" : url.substr(path_start);
+
+  auto colon = authority.rfind(':');
+  if (colon != std::string::npos) {
+    out.host = authority.substr(0, colon);
+    out.port = authority.substr(colon + 1);
+  } else {
+    out.host = authority;
+    out.port = out.tls ? "443" : "80";
+  }
+
+  if (out.host.empty()) {
+    throw std::invalid_argument("url host is empty");
+  }
+  return out;
+}
+
+http::verb parse_method(const std::string& method) {
+  std::string upper = method;
+  std::transform(upper.begin(), upper.end(), upper.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+  if (upper == "GET") return http::verb::get;
+  if (upper == "POST") return http::verb::post;
+  if (upper == "PUT") return http::verb::put;
+  if (upper == "PATCH") return http::verb::patch;
+  if (upper == "DELETE") return http::verb::delete_;
+  if (upper == "HEAD") return http::verb::head;
+  return http::verb::unknown;
+}
+
+std::pair<std::string, std::string> split_header(const std::string& header) {
+  auto pos = header.find(':');
+  if (pos == std::string::npos) {
+    return {header, ""};
+  }
+  auto name = header.substr(0, pos);
+  auto value = header.substr(pos + 1);
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+    value.erase(value.begin());
+  }
+  return {name, value};
+}
+
+bool header_name_equals(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+long parse_status_code(std::string_view headers) {
+  auto first_space = headers.find(' ');
+  if (first_space == std::string_view::npos || first_space + 4 > headers.size()) {
+    return 0;
+  }
+  long status = 0;
+  for (std::size_t i = first_space + 1; i < first_space + 4; ++i) {
+    if (headers[i] < '0' || headers[i] > '9') {
+      return 0;
+    }
+    status = status * 10 + (headers[i] - '0');
+  }
+  return status;
+}
+
+std::size_t parse_content_length(std::string_view headers) {
+  std::size_t line = 0;
+  constexpr std::string_view name = "content-length:";
+  while ((line = headers.find("\r\n", line)) != std::string_view::npos) {
+    line += 2;
+    if (line + name.size() > headers.size()) {
+      break;
+    }
+    bool match = true;
+    for (std::size_t i = 0; i < name.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(headers[line + i])) != name[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (!match) {
+      continue;
+    }
+    auto pos = line + name.size();
+    while (pos < headers.size() &&
+           std::isspace(static_cast<unsigned char>(headers[pos]))) {
+      ++pos;
+    }
+    std::size_t len = 0;
+    while (pos < headers.size() && headers[pos] >= '0' && headers[pos] <= '9') {
+      len = len * 10 + static_cast<std::size_t>(headers[pos] - '0');
+      ++pos;
+    }
+    return len;
+  }
+  return 0;
+}
+
+AsioHttpClient::ProbeProtocol selected_alpn(SSL* ssl) {
+  const unsigned char* selected = nullptr;
+  unsigned int selected_len = 0;
+  SSL_get0_alpn_selected(ssl, &selected, &selected_len);
+  if (selected_len == 2 && std::memcmp(selected, "h2", 2) == 0) {
+    return AsioHttpClient::ProbeProtocol::H2;
+  }
+  if (selected_len == 8 && std::memcmp(selected, "http/1.1", 8) == 0) {
+    return AsioHttpClient::ProbeProtocol::Http11;
+  }
+  return AsioHttpClient::ProbeProtocol::Unknown;
+}
+
+void set_h2_h1_alpn(SSL* ssl) {
+  static const unsigned char alpn[] = {
+      2, 'h', '2',
+      8, 'h', 't', 't', 'p', '/', '1', '.', '1',
+  };
+  SSL_set_alpn_protos(ssl, alpn, sizeof(alpn));
+}
+
+template <class Stream>
+asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& read_buf,
+                                                std::string& write_buf,
+                                                const ParsedUrl& url, Request request,
+                                                std::chrono::steady_clock::time_point start) {
+  write_buf.reserve(256 + request.body.size());
+  write_buf.clear();
+  write_buf.append(request.method.empty() ? "GET" : request.method);
+  write_buf.push_back(' ');
+  write_buf.append(url.target);
+  write_buf.append(" HTTP/1.1\r\nHost: ");
+  write_buf.append(url.host);
+  write_buf.append("\r\n");
+  bool has_user_agent = false;
+  bool has_accept = false;
+  for (const auto& header : request.headers) {
+    auto [name, _] = split_header(header);
+    has_user_agent = has_user_agent || header_name_equals(name, "user-agent");
+    has_accept = has_accept || header_name_equals(name, "accept");
+  }
+  if (!has_user_agent) {
+    write_buf.append("User-Agent: httpclient-asio-light\r\n");
+  }
+  if (!has_accept) {
+    write_buf.append("Accept: */*\r\n");
+  }
+  for (const auto& header : request.headers) {
+    auto [name, value] = split_header(header);
+    if (name.empty() || header_name_equals(name, "host") ||
+        header_name_equals(name, "content-length") ||
+        header_name_equals(name, "connection")) {
+      continue;
+    }
+    write_buf.append(name);
+    write_buf.append(": ");
+    write_buf.append(value);
+    write_buf.append("\r\n");
+  }
+  if (!request.body.empty()) {
+    write_buf.append("Content-Length: ");
+    write_buf.append(std::to_string(request.body.size()));
+    write_buf.append("\r\n");
+  }
+  write_buf.append("Connection: keep-alive\r\n\r\n");
+  write_buf.append(request.body);
+
+  try {
+    co_await asio::async_write(stream, asio::buffer(write_buf), asio::use_awaitable);
+  } catch (const std::exception& e) {
+    throw stage_error("h1_write", e);
+  }
+
+  read_buf.clear();
+  std::array<char, 32768> tmp{};
+  std::size_t header_end = std::string::npos;
+  for (;;) {
+    std::size_t n = 0;
+    try {
+      n = co_await stream.async_read_some(asio::buffer(tmp), asio::use_awaitable);
+    } catch (const std::exception& e) {
+      throw stage_error("h1_read_headers", e);
+    }
+    read_buf.append(tmp.data(), n);
+    header_end = read_buf.find("\r\n\r\n");
+    if (header_end != std::string::npos) {
+      break;
+    }
+    if (read_buf.size() > 65536) {
+      throw std::runtime_error("h1 response headers too large");
+    }
+  }
+
+  auto headers = std::string_view(read_buf.data(), header_end + 4);
+  auto content_length = parse_content_length(headers);
+  auto body_start = header_end + 4;
+  auto have_body = read_buf.size() - body_start;
+  while (have_body < content_length) {
+    auto remaining = content_length - have_body;
+    std::size_t n = 0;
+    try {
+      n = co_await stream.async_read_some(
+          asio::buffer(tmp.data(), std::min(tmp.size(), remaining)), asio::use_awaitable);
+    } catch (const std::exception& e) {
+      throw stage_error("h1_read_body", e);
+    }
+    if (request.store_response_body) {
+      read_buf.append(tmp.data(), n);
+    }
+    have_body += n;
+  }
+
+  Response response;
+  response.status = parse_status_code(headers);
+  response.http_version = 1;
+  if (request.store_response_body && content_length > 0) {
+    response.body.assign(read_buf.data() + body_start, content_length);
+  }
+  if (request.measure_total_time) {
+    response.total_time_sec =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  }
+  co_return response;
+}
+
+template <class Stream>
+asio::awaitable<Response> run_http_exchange(Stream& stream, beast::flat_buffer& buffer,
+                                            const ParsedUrl& url,
+                                            Request request,
+                                            std::chrono::steady_clock::time_point start) {
+  buffer.consume(buffer.size());
+  http::request<http::string_body> req{parse_method(request.method), url.target, 11};
+  req.set(http::field::host, url.host);
+  req.set(http::field::user_agent, "httpclient-asio");
+  for (const auto& header : request.headers) {
+    auto [name, value] = split_header(header);
+    if (!name.empty()) {
+      req.set(name, value);
+    }
+  }
+  req.body() = std::move(request.body);
+  req.prepare_payload();
+
+  co_await http::async_write(stream, req, asio::use_awaitable);
+
+  http::response<http::string_body> res;
+  co_await http::async_read(stream, buffer, res, asio::use_awaitable);
+  Response response;
+  response.status = static_cast<long>(res.result_int());
+  if (request.store_response_body) {
+    response.body = std::move(res.body());
+  }
+  response.total_time_sec =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  response.http_version = res.version() == 11 ? 1 : 0;
+  if (request.store_response_headers) {
+    for (auto const& field : res.base()) {
+      response.headers.emplace_back(std::string(field.name_string()) + ": " +
+                                    std::string(field.value()));
+    }
+  }
+  if (request.measure_total_time) {
+    response.total_time_sec =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  }
+  co_return response;
+}
+
+}  // namespace
+
+struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
+  struct OriginPool;
+  struct H1TlsActor;
+
+  struct Shard {
+    asio::io_context io;
+    asio::executor_work_guard<asio::io_context::executor_type> work;
+    std::jthread thread;
+    std::unordered_map<std::string, std::shared_ptr<OriginPool>> origins;
+    std::list<std::string> origin_lru;
+
+    Shard() : io(1), work(asio::make_work_guard(io)) {}
+  };
+
+  struct PlainConnection {
+    explicit PlainConnection(asio::any_io_executor executor) : stream(executor) {
+      read_buffer.reserve(8192);
+      write_buffer.reserve(8192);
+    }
+    beast::tcp_stream stream;
+    beast::flat_buffer buffer;
+    std::string read_buffer;
+    std::string write_buffer;
+  };
+
+  struct TlsConnection {
+    TlsConnection(asio::any_io_executor executor, asio::ssl::context& ssl_ctx)
+        : stream(executor, ssl_ctx) {
+      read_buffer.reserve(8192);
+      write_buffer.reserve(8192);
+    }
+
+    beast::ssl_stream<beast::tcp_stream> stream;
+    beast::flat_buffer buffer;
+    std::string read_buffer;
+    std::string write_buffer;
+  };
+
+  struct OriginPool {
+    OriginPool(asio::any_io_executor executor, bool verify_tls)
+        : executor(executor),
+          strand(executor),
+          ssl_ctx(asio::ssl::context::tls_client) {
+      if (verify_tls) {
+        ssl_ctx.set_default_verify_paths();
+      } else {
+        ssl_ctx.set_verify_mode(asio::ssl::verify_none);
+      }
+    }
+
+    asio::any_io_executor executor;
+    asio::strand<asio::any_io_executor> strand;
+    asio::ssl::context ssl_ctx;
+    std::vector<std::unique_ptr<PlainConnection>> idle_plain;
+    std::vector<std::unique_ptr<TlsConnection>> idle_tls;
+    std::deque<std::shared_ptr<asio::steady_timer>> wait_plain;
+    std::deque<std::shared_ptr<asio::steady_timer>> wait_tls;
+    std::vector<std::shared_ptr<H1TlsActor>> h1_tls_actors;
+    std::list<std::string>::iterator lru_it;
+    std::chrono::steady_clock::time_point last_used{};
+    std::size_t next_h1_tls_actor = 0;
+    std::size_t active_plain = 0;
+    std::size_t active_tls = 0;
+    bool lru_linked = false;
+  };
+
+  struct Counters {
+    std::atomic<std::uint64_t> h1_conn_created{0};
+    std::atomic<std::uint64_t> h1_idle_hit{0};
+    std::atomic<std::uint64_t> h1_idle_miss{0};
+    std::atomic<std::uint64_t> h1_conn_reused{0};
+    std::atomic<std::uint64_t> h1_return_to_idle{0};
+    std::atomic<std::uint64_t> h1_close_after_response{0};
+    std::atomic<std::uint64_t> h1_reuse_failed{0};
+    std::atomic<std::uint64_t> h1_reconnect_after_idle{0};
+  };
+
+  static void close_plain(PlainConnection& conn) {
+    boost::system::error_code ec;
+    conn.stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+    conn.stream.socket().close(ec);
+  }
+
+  static void close_tls(TlsConnection& conn) {
+    boost::system::error_code ec;
+    beast::get_lowest_layer(conn.stream).socket().shutdown(tcp::socket::shutdown_both, ec);
+    beast::get_lowest_layer(conn.stream).socket().close(ec);
+  }
+
+  static void wake_one(std::deque<std::shared_ptr<asio::steady_timer>>& waiters) {
+    while (!waiters.empty()) {
+      auto waiter = std::move(waiters.front());
+      waiters.pop_front();
+      if (waiter) {
+        waiter->cancel();
+        return;
+      }
+    }
+  }
+
+  static bool pool_idle(const std::shared_ptr<OriginPool>& pool) {
+    return pool && pool->active_plain == pool->idle_plain.size() &&
+           pool->active_tls == pool->idle_tls.size() && pool->wait_plain.empty() &&
+           pool->wait_tls.empty() && pool->h1_tls_actors.empty();
+  }
+
+  static void close_pool_idle(OriginPool& pool) {
+    for (auto& conn : pool.idle_plain) {
+      if (conn) {
+        close_plain(*conn);
+      }
+    }
+    for (auto& conn : pool.idle_tls) {
+      if (conn) {
+        close_tls(*conn);
+      }
+    }
+    pool.idle_plain.clear();
+    pool.idle_tls.clear();
+    pool.active_plain = 0;
+    pool.active_tls = 0;
+  }
+
+  struct AcquiredConnection {
+    std::unique_ptr<PlainConnection> plain;
+    std::unique_ptr<TlsConnection> tls;
+    bool reused = false;
+  };
+
+  struct H1TlsActor : std::enable_shared_from_this<H1TlsActor> {
+    struct Item {
+      Request request;
+      std::chrono::steady_clock::time_point start;
+      Response response;
+      std::shared_ptr<asio::steady_timer> notify;
+    };
+
+    H1TlsActor(asio::any_io_executor executor, std::shared_ptr<OriginPool> pool,
+               ParsedUrl url)
+        : strand(asio::make_strand(executor)),
+          pool(std::move(pool)),
+          url(std::move(url)) {}
+
+    asio::awaitable<Response> submit(Request request,
+                                     std::chrono::steady_clock::time_point start) {
+      auto ex = co_await asio::this_coro::executor;
+      auto item = std::make_shared<Item>();
+      item->request = std::move(request);
+      item->start = start;
+      item->notify = std::make_shared<asio::steady_timer>(ex);
+      item->notify->expires_at(asio::steady_timer::time_point::max());
+
+      auto self = shared_from_this();
+      co_await asio::co_spawn(
+          strand,
+          [self, item]() -> asio::awaitable<void> {
+            self->queue.push_back(item);
+            if (!self->running) {
+              self->running = true;
+              asio::co_spawn(self->strand, self->run(), asio::detached);
+            }
+            co_return;
+          },
+          asio::use_awaitable);
+
+      boost::system::error_code ec;
+      co_await item->notify->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+      co_return std::move(item->response);
+    }
+
+    asio::awaitable<void> run() {
+      for (;;) {
+        if (queue.empty()) {
+          running = false;
+          co_return;
+        }
+
+        auto item = std::move(queue.front());
+        queue.pop_front();
+
+        try {
+          auto timeout = std::chrono::milliseconds(item->request.timeout_ms);
+          co_await ensure_connected(item->request, timeout);
+          beast::get_lowest_layer(conn->stream).expires_after(timeout);
+          item->response =
+              co_await run_http_exchange(conn->stream, conn->buffer, url,
+                                         std::move(item->request), item->start);
+        } catch (const std::exception& e) {
+          item->response.error = e.what();
+          if (item->request.measure_total_time) {
+            item->response.total_time_sec =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                              item->start)
+                    .count();
+          }
+          close();
+        }
+
+        if (item->notify) {
+          item->notify->cancel();
+        }
+      }
+    }
+
+    asio::awaitable<void> ensure_connected(const Request& request,
+                                           std::chrono::milliseconds timeout) {
+      if (conn) {
+        co_return;
+      }
+
+      conn = std::make_unique<TlsConnection>(strand, pool->ssl_ctx);
+      if (request.verify_peer && request.verify_host) {
+        conn->stream.set_verify_mode(asio::ssl::verify_peer);
+      } else {
+        conn->stream.set_verify_mode(asio::ssl::verify_none);
+      }
+
+      if (!SSL_set_tlsext_host_name(conn->stream.native_handle(), url.host.c_str())) {
+        throw beast::system_error(
+            beast::error_code(static_cast<int>(::ERR_get_error()),
+                              asio::error::get_ssl_category()));
+      }
+
+      tcp::resolver resolver(strand);
+      beast::get_lowest_layer(conn->stream).expires_after(timeout);
+      auto results = co_await resolver.async_resolve(url.host, url.port,
+                                                     asio::use_awaitable);
+      co_await beast::get_lowest_layer(conn->stream)
+          .async_connect(results, asio::use_awaitable);
+      boost::system::error_code option_ec;
+      beast::get_lowest_layer(conn->stream)
+          .socket()
+          .set_option(tcp::no_delay(true), option_ec);
+      co_await conn->stream.async_handshake(asio::ssl::stream_base::client,
+                                            asio::use_awaitable);
+    }
+
+    void close() {
+      if (!conn) {
+        return;
+      }
+      boost::system::error_code ec;
+      beast::get_lowest_layer(conn->stream).socket().shutdown(tcp::socket::shutdown_both,
+                                                              ec);
+      beast::get_lowest_layer(conn->stream).socket().close(ec);
+      conn.reset();
+    }
+
+    asio::strand<asio::any_io_executor> strand;
+    std::shared_ptr<OriginPool> pool;
+    ParsedUrl url;
+    std::unique_ptr<TlsConnection> conn;
+    std::deque<std::shared_ptr<Item>> queue;
+    bool running = false;
+  };
+
+  explicit Impl(Options options) : options_(options) {
+    if (options_.shard_count == 0) {
+      auto n = std::thread::hardware_concurrency();
+      options_.shard_count = std::max<std::size_t>(1, std::min<std::size_t>(4, n));
+    }
+    shards_.reserve(options_.shard_count);
+    for (std::size_t i = 0; i < options_.shard_count; ++i) {
+      shards_.push_back(std::make_unique<Shard>());
+    }
+    for (auto& shard : shards_) {
+      auto* shard_ptr = shard.get();
+      shard->thread = std::jthread([shard_ptr] { shard_ptr->io.run(); });
+    }
+  }
+
+  ~Impl() {
+    for (auto& shard : shards_) {
+      shard->work.reset();
+      shard->io.stop();
+    }
+  }
+
+  asio::awaitable<void> reset_connections() {
+    for (auto& shard : shards_) {
+      co_await asio::co_spawn(
+          shard->io, [shard = shard.get()]() -> asio::awaitable<void> {
+            for (auto& [_, pool] : shard->origins) {
+              auto closed_plain = pool->idle_plain.size();
+              auto closed_tls = pool->idle_tls.size();
+              for (auto& conn : pool->idle_plain) {
+                if (conn) {
+                  close_plain(*conn);
+                }
+              }
+              for (auto& conn : pool->idle_tls) {
+                if (conn) {
+                  close_tls(*conn);
+                }
+              }
+              pool->idle_plain.clear();
+              pool->idle_tls.clear();
+              pool->active_plain =
+                  closed_plain > pool->active_plain ? 0 : pool->active_plain - closed_plain;
+              pool->active_tls =
+                  closed_tls > pool->active_tls ? 0 : pool->active_tls - closed_tls;
+              wake_one(pool->wait_plain);
+              wake_one(pool->wait_tls);
+              for (auto& actor : pool->h1_tls_actors) {
+                if (actor) {
+                  actor->close();
+                }
+              }
+              pool->h1_tls_actors.clear();
+            }
+            co_return;
+          },
+          asio::use_awaitable);
+    }
+  }
+
+  Shard& pick_shard(const ParsedUrl& url) {
+    auto key = url.scheme + "://" + url.host + ":" + url.port;
+    auto idx = std::hash<std::string>{}(key) % shards_.size();
+    return *shards_[idx];
+  }
+
+  Shard& pick_request_shard(const ParsedUrl& url) {
+    if (!options_.stripe_origins_across_shards) {
+      return pick_shard(url);
+    }
+    auto key = url.scheme + "://" + url.host + ":" + url.port;
+    auto base = std::hash<std::string>{}(key);
+    auto seq = next_request_shard_.fetch_add(1, std::memory_order_relaxed);
+    return *shards_[(base + seq) % shards_.size()];
+  }
+
+  std::shared_ptr<OriginPool> get_origin_pool(Shard& shard, const ParsedUrl& url) {
+    auto key = url.scheme + "://" + url.host + ":" + url.port;
+    auto it = shard.origins.find(key);
+    if (it != shard.origins.end()) {
+      touch_origin(shard, key, *it->second);
+      return it->second;
+    }
+    evict_idle_origins(shard);
+    auto pool =
+        std::make_shared<OriginPool>(shard.io.get_executor(), options_.enable_ssl_verify);
+    pool->last_used = std::chrono::steady_clock::now();
+    shard.origin_lru.push_front(key);
+    pool->lru_it = shard.origin_lru.begin();
+    pool->lru_linked = true;
+    shard.origins.emplace(std::move(key), pool);
+    return pool;
+  }
+
+  void touch_origin(Shard& shard, const std::string& key, OriginPool& pool) {
+    pool.last_used = std::chrono::steady_clock::now();
+    if (!pool.lru_linked) {
+      shard.origin_lru.push_front(key);
+      pool.lru_it = shard.origin_lru.begin();
+      pool.lru_linked = true;
+      return;
+    }
+    shard.origin_lru.splice(shard.origin_lru.begin(), shard.origin_lru, pool.lru_it);
+  }
+
+  void evict_idle_origins(Shard& shard) {
+    const auto max_origins = options_.max_origins_per_shard;
+    if (max_origins == 0) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto ttl = options_.origin_idle_ttl;
+    auto should_evict_by_ttl = [&](const std::shared_ptr<OriginPool>& pool) {
+      return ttl.count() > 0 && pool &&
+             now - pool->last_used >= ttl;
+    };
+
+    for (auto it = shard.origin_lru.rbegin(); it != shard.origin_lru.rend();) {
+      auto map_it = shard.origins.find(*it);
+      if (map_it == shard.origins.end()) {
+        auto erase_it = std::next(it).base();
+        it = std::make_reverse_iterator(shard.origin_lru.erase(erase_it));
+        continue;
+      }
+      auto& pool = map_it->second;
+      if (pool_idle(pool) && (should_evict_by_ttl(pool) ||
+                              shard.origins.size() > max_origins)) {
+        close_pool_idle(*pool);
+        pool->lru_linked = false;
+        auto erase_key_it = std::next(it).base();
+        it = std::make_reverse_iterator(shard.origin_lru.erase(erase_key_it));
+        shard.origins.erase(map_it);
+        continue;
+      }
+      if (shard.origins.size() <= max_origins) {
+        break;
+      }
+      ++it;
+    }
+  }
+
+  asio::awaitable<AcquiredConnection> acquire_plain(
+      std::shared_ptr<OriginPool> pool, const ParsedUrl& url,
+      std::chrono::milliseconds timeout) {
+    const auto max_connections =
+        std::max<std::size_t>(1, options_.max_connections_per_origin);
+    for (;;) {
+      AcquiredConnection conn;
+      if (!pool->idle_plain.empty()) {
+        conn.plain = std::move(pool->idle_plain.back());
+        pool->idle_plain.pop_back();
+        conn.reused = true;
+        ++stats_.h1_idle_hit;
+        ++stats_.h1_conn_reused;
+        co_return conn;
+      }
+      if (pool->active_plain < max_connections) {
+        ++pool->active_plain;
+        ++stats_.h1_idle_miss;
+        auto new_conn =
+            std::make_unique<PlainConnection>(co_await asio::this_coro::executor);
+        ++stats_.h1_conn_created;
+        tcp::resolver resolver(co_await asio::this_coro::executor);
+        new_conn->stream.expires_after(timeout);
+        auto results = co_await resolver.async_resolve(url.host, url.port,
+                                                       asio::use_awaitable);
+        co_await new_conn->stream.async_connect(results, asio::use_awaitable);
+        boost::system::error_code option_ec;
+        new_conn->stream.socket().set_option(tcp::no_delay(true), option_ec);
+        co_return AcquiredConnection{std::move(new_conn), {}, false};
+      }
+
+      auto waiter =
+          std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
+      waiter->expires_at(asio::steady_timer::time_point::max());
+      pool->wait_plain.push_back(waiter);
+      boost::system::error_code ec;
+      co_await waiter->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+    }
+  }
+
+  asio::awaitable<AcquiredConnection> acquire_tls(
+      std::shared_ptr<OriginPool> pool, const ParsedUrl& url, const Request& request,
+      std::chrono::milliseconds timeout) {
+    const auto max_connections =
+        std::max<std::size_t>(1, options_.max_connections_per_origin);
+    for (;;) {
+      AcquiredConnection conn;
+      if (!pool->idle_tls.empty()) {
+        conn.tls = std::move(pool->idle_tls.back());
+        pool->idle_tls.pop_back();
+        conn.reused = true;
+        ++stats_.h1_idle_hit;
+        ++stats_.h1_conn_reused;
+        co_return conn;
+      }
+      if (pool->active_tls >= max_connections) {
+        auto waiter =
+            std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
+        waiter->expires_at(asio::steady_timer::time_point::max());
+        pool->wait_tls.push_back(waiter);
+        boost::system::error_code ec;
+        co_await waiter->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        continue;
+      }
+      ++pool->active_tls;
+      ++stats_.h1_idle_miss;
+      break;
+    }
+
+    auto new_conn =
+        std::make_unique<TlsConnection>(co_await asio::this_coro::executor,
+                                        pool->ssl_ctx);
+    ++stats_.h1_conn_created;
+    if (request.verify_peer && request.verify_host && options_.enable_ssl_verify) {
+      new_conn->stream.set_verify_mode(asio::ssl::verify_peer);
+    } else {
+      new_conn->stream.set_verify_mode(asio::ssl::verify_none);
+    }
+
+    if (!SSL_set_tlsext_host_name(new_conn->stream.native_handle(), url.host.c_str())) {
+      throw beast::system_error(
+          beast::error_code(static_cast<int>(::ERR_get_error()),
+                            asio::error::get_ssl_category()));
+    }
+
+    tcp::resolver resolver(co_await asio::this_coro::executor);
+    beast::get_lowest_layer(new_conn->stream).expires_after(timeout);
+    tcp::resolver::results_type results;
+    try {
+      results = co_await resolver.async_resolve(url.host, url.port,
+                                                asio::use_awaitable);
+    } catch (const std::exception& e) {
+      throw stage_error("tls_resolve", e);
+    }
+    try {
+      co_await beast::get_lowest_layer(new_conn->stream)
+          .async_connect(results, asio::use_awaitable);
+      boost::system::error_code option_ec;
+      beast::get_lowest_layer(new_conn->stream)
+          .socket()
+          .set_option(tcp::no_delay(true), option_ec);
+    } catch (const std::exception& e) {
+      throw stage_error("tls_connect", e);
+    }
+    try {
+      co_await new_conn->stream.async_handshake(asio::ssl::stream_base::client,
+                                                asio::use_awaitable);
+    } catch (const std::exception& e) {
+      throw stage_error("tls_handshake", e);
+    }
+    co_return AcquiredConnection{{}, std::move(new_conn), false};
+  }
+
+  asio::awaitable<std::unique_ptr<TlsConnection>> connect_probe_tls(
+      std::shared_ptr<OriginPool> pool, const ParsedUrl& url, const Request& request,
+      std::chrono::milliseconds timeout) {
+    const auto max_connections =
+        std::max<std::size_t>(1, options_.max_connections_per_origin);
+    while (pool->active_tls >= max_connections && pool->idle_tls.empty()) {
+      auto waiter =
+          std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
+      waiter->expires_at(asio::steady_timer::time_point::max());
+      pool->wait_tls.push_back(waiter);
+      boost::system::error_code ec;
+      co_await waiter->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+    }
+    if (!pool->idle_tls.empty()) {
+      auto conn = std::move(pool->idle_tls.back());
+      pool->idle_tls.pop_back();
+      set_h2_h1_alpn(conn->stream.native_handle());
+      co_return conn;
+    }
+    ++pool->active_tls;
+
+    auto conn =
+        std::make_unique<TlsConnection>(co_await asio::this_coro::executor,
+                                        pool->ssl_ctx);
+    if (request.verify_peer && request.verify_host && options_.enable_ssl_verify) {
+      conn->stream.set_verify_mode(asio::ssl::verify_peer);
+    } else {
+      conn->stream.set_verify_mode(asio::ssl::verify_none);
+    }
+
+    if (!SSL_set_tlsext_host_name(conn->stream.native_handle(), url.host.c_str())) {
+      throw beast::system_error(
+          beast::error_code(static_cast<int>(::ERR_get_error()),
+                            asio::error::get_ssl_category()));
+    }
+    set_h2_h1_alpn(conn->stream.native_handle());
+
+    tcp::resolver resolver(co_await asio::this_coro::executor);
+    beast::get_lowest_layer(conn->stream).expires_after(timeout);
+    auto results = co_await resolver.async_resolve(url.host, url.port,
+                                                   asio::use_awaitable);
+    co_await beast::get_lowest_layer(conn->stream)
+        .async_connect(results, asio::use_awaitable);
+    boost::system::error_code option_ec;
+    beast::get_lowest_layer(conn->stream)
+        .socket()
+        .set_option(tcp::no_delay(true), option_ec);
+    co_await conn->stream.async_handshake(asio::ssl::stream_base::client,
+                                          asio::use_awaitable);
+    co_return conn;
+  }
+
+  asio::awaitable<Response> run_pooled_request(std::shared_ptr<OriginPool> pool,
+                                               ParsedUrl url, Request request,
+                                               std::chrono::steady_clock::time_point start) {
+    auto timeout = std::chrono::milliseconds(request.timeout_ms);
+
+    if (url.tls) {
+    auto conn = co_await acquire_tls(pool, url, request, timeout);
+    auto* tls_conn = conn.tls.get();
+    beast::get_lowest_layer(tls_conn->stream).expires_after(timeout);
+    Response response;
+    if (options_.use_lightweight_h1) {
+        response = co_await run_light_h1_exchange(tls_conn->stream, tls_conn->read_buffer,
+                                                  tls_conn->write_buffer, url,
+                                                  std::move(request), start);
+      } else {
+        response =
+            co_await run_http_exchange(tls_conn->stream, tls_conn->buffer, url,
+                                       std::move(request), start);
+      }
+      if (response.error.empty()) {
+        pool->idle_tls.push_back(std::move(conn.tls));
+        ++stats_.h1_return_to_idle;
+        wake_one(pool->wait_tls);
+      } else {
+        ++stats_.h1_close_after_response;
+        if (pool->active_tls > 0) {
+          --pool->active_tls;
+        }
+        wake_one(pool->wait_tls);
+        if (conn.reused) {
+          ++stats_.h1_reuse_failed;
+          ++stats_.h1_reconnect_after_idle;
+        }
+      }
+      co_return response;
+    }
+
+    auto conn = co_await acquire_plain(pool, url, timeout);
+    auto* plain_conn = conn.plain.get();
+    plain_conn->stream.expires_after(timeout);
+    Response response;
+    if (options_.use_lightweight_h1) {
+      response = co_await run_light_h1_exchange(plain_conn->stream, plain_conn->read_buffer,
+                                                plain_conn->write_buffer, url,
+                                                std::move(request), start);
+    } else {
+      response =
+          co_await run_http_exchange(plain_conn->stream, plain_conn->buffer, url, std::move(request),
+                                     start);
+    }
+    if (response.error.empty()) {
+      pool->idle_plain.push_back(std::move(conn.plain));
+      ++stats_.h1_return_to_idle;
+      wake_one(pool->wait_plain);
+    } else {
+      ++stats_.h1_close_after_response;
+      if (pool->active_plain > 0) {
+        --pool->active_plain;
+      }
+      wake_one(pool->wait_plain);
+      if (conn.reused) {
+        ++stats_.h1_reuse_failed;
+        ++stats_.h1_reconnect_after_idle;
+      }
+    }
+    co_return response;
+  }
+
+  asio::awaitable<ProbeResult> probe_request(Request request) {
+    auto start = std::chrono::steady_clock::now();
+    ProbeResult result;
+    try {
+      auto url = parse_url(request.url);
+      if (!url.tls) {
+        result.protocol = ProbeProtocol::Http11;
+        result.response = co_await this->request(std::move(request));
+        co_return result;
+      }
+
+      auto& shard = pick_shard(url);
+      co_return co_await asio::co_spawn(
+          shard.io,
+          [self = shared_from_this(), shard = &shard, url, request = std::move(request),
+           start]() mutable -> asio::awaitable<ProbeResult> {
+            auto pool = self->get_origin_pool(*shard, url);
+            ProbeResult result;
+            auto timeout = std::chrono::milliseconds(request.timeout_ms);
+            auto conn = co_await self->connect_probe_tls(pool, url, request, timeout);
+            auto protocol = selected_alpn(conn->stream.native_handle());
+            result.protocol = protocol;
+            if (protocol == ProbeProtocol::H2) {
+              boost::system::error_code ec;
+              beast::get_lowest_layer(conn->stream)
+                  .socket()
+                  .shutdown(tcp::socket::shutdown_both, ec);
+              beast::get_lowest_layer(conn->stream).socket().close(ec);
+              if (pool->active_tls > 0) {
+                --pool->active_tls;
+              }
+              wake_one(pool->wait_tls);
+              co_return result;
+            }
+
+            beast::get_lowest_layer(conn->stream).expires_after(timeout);
+            if (self->options_.use_lightweight_h1) {
+              result.response = co_await run_light_h1_exchange(conn->stream, conn->read_buffer,
+                                                               conn->write_buffer, url,
+                                                               std::move(request), start);
+            } else {
+              result.response =
+                  co_await run_http_exchange(conn->stream, conn->buffer, url,
+                                             std::move(request), start);
+            }
+            if (result.response.error.empty()) {
+              pool->idle_tls.push_back(std::move(conn));
+              wake_one(pool->wait_tls);
+            } else {
+              if (pool->active_tls > 0) {
+                --pool->active_tls;
+              }
+              wake_one(pool->wait_tls);
+            }
+            if (request.measure_total_time) {
+              result.response.total_time_sec =
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+                      .count();
+            }
+            co_return result;
+          },
+          asio::use_awaitable);
+    } catch (const std::exception& e) {
+      result.protocol = ProbeProtocol::Unknown;
+      result.response.error = e.what();
+      if (request.measure_total_time) {
+        result.response.total_time_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+                .count();
+      }
+      co_return result;
+    }
+  }
+
+  asio::awaitable<Response> run_h1_actor_request(std::shared_ptr<OriginPool> pool,
+                                                 ParsedUrl url, Request request,
+                                                 std::chrono::steady_clock::time_point start) {
+    auto actors_per_origin = options_.h1_actor_connections_per_origin;
+    auto actor = co_await asio::co_spawn(
+        pool->strand,
+        [pool, url, actors_per_origin]() mutable
+            -> asio::awaitable<std::shared_ptr<H1TlsActor>> {
+          auto target = std::max<std::size_t>(
+              1, std::min<std::size_t>(actors_per_origin, 256));
+          while (pool->h1_tls_actors.size() < target) {
+            pool->h1_tls_actors.push_back(
+                std::make_shared<H1TlsActor>(pool->executor, pool, url));
+          }
+          auto actor =
+              pool->h1_tls_actors[pool->next_h1_tls_actor++ % pool->h1_tls_actors.size()];
+          co_return actor;
+        },
+        asio::use_awaitable);
+
+    co_return co_await actor->submit(std::move(request), start);
+  }
+
+  asio::awaitable<Response> request(Request request) {
+    auto start = std::chrono::steady_clock::now();
+    try {
+      auto url = parse_url(request.url);
+      auto& shard = pick_request_shard(url);
+
+      co_return co_await asio::co_spawn(
+          shard.io,
+          [self = shared_from_this(), shard = &shard, url, request = std::move(request),
+           start]() mutable -> asio::awaitable<Response> {
+            auto pool = self->get_origin_pool(*shard, url);
+            if (self->options_.use_h1_connection_actor && url.tls) {
+              co_return co_await self->run_h1_actor_request(pool, url, std::move(request),
+                                                            start);
+            }
+            co_return co_await self->run_pooled_request(pool, url, std::move(request),
+                                                        start);
+          },
+          asio::use_awaitable);
+    } catch (const std::exception& e) {
+      Response response;
+      response.error = e.what();
+      if (request.measure_total_time) {
+        response.total_time_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+                .count();
+      }
+      co_return response;
+    }
+  }
+
+  void submit(Request request, AsioHttpClient::ResponseHandler handler) {
+    auto start = std::chrono::steady_clock::now();
+    ParsedUrl url;
+    try {
+      url = parse_url(request.url);
+    } catch (const std::exception& e) {
+      Response response;
+      response.error = e.what();
+      if (request.measure_total_time) {
+        response.total_time_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+                .count();
+      }
+      handler(std::move(response));
+      return;
+    }
+
+    auto& shard = pick_request_shard(url);
+    auto self = shared_from_this();
+    asio::co_spawn(
+        shard.io,
+        [self, shard = &shard, url = std::move(url), request = std::move(request), start,
+         handler = std::move(handler)]() mutable -> asio::awaitable<void> {
+          auto pool = self->get_origin_pool(*shard, url);
+          Response response;
+          try {
+            if (self->options_.use_h1_connection_actor && url.tls) {
+              response =
+                  co_await self->run_h1_actor_request(pool, url, std::move(request),
+                                                      start);
+            } else {
+              response =
+                  co_await self->run_pooled_request(pool, url, std::move(request),
+                                                    start);
+            }
+          } catch (const std::exception& e) {
+            response.error = e.what();
+            if (request.measure_total_time) {
+              response.total_time_sec =
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                start)
+                      .count();
+            }
+          }
+          handler(std::move(response));
+        },
+        asio::detached);
+  }
+
+  Options options_;
+  std::vector<std::unique_ptr<Shard>> shards_;
+  std::atomic<std::size_t> next_request_shard_{0};
+  Counters stats_;
+};
+
+AsioHttpClient::AsioHttpClient() : AsioHttpClient(Options{}) {}
+
+AsioHttpClient::AsioHttpClient(Options options)
+    : impl_(std::make_shared<Impl>(options)) {}
+
+AsioHttpClient::~AsioHttpClient() = default;
+
+asio::awaitable<Response> AsioHttpClient::async_request(Request request) {
+  return impl_->request(std::move(request));
+}
+
+void AsioHttpClient::async_request_callback(Request request,
+                                            ResponseHandler handler) {
+  impl_->submit(std::move(request), std::move(handler));
+}
+
+asio::awaitable<AsioHttpClient::ProbeResult> AsioHttpClient::async_probe(
+    Request request) {
+  return impl_->probe_request(std::move(request));
+}
+
+AsioHttpClient::Stats AsioHttpClient::stats() const {
+  return AsioHttpClient::Stats{
+      impl_->stats_.h1_conn_created.load(),
+      impl_->stats_.h1_idle_hit.load(),
+      impl_->stats_.h1_idle_miss.load(),
+      impl_->stats_.h1_conn_reused.load(),
+      impl_->stats_.h1_return_to_idle.load(),
+      impl_->stats_.h1_close_after_response.load(),
+      impl_->stats_.h1_reuse_failed.load(),
+      impl_->stats_.h1_reconnect_after_idle.load(),
+  };
+}
+
+asio::awaitable<void> AsioHttpClient::reset_connections() {
+  co_return co_await impl_->reset_connections();
+}
+
+}  // namespace httpclient

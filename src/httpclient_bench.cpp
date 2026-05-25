@@ -1,0 +1,480 @@
+#include "httpclient/http_client.hpp"
+
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_awaitable.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstdint>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <string_view>
+
+namespace asio = boost::asio;
+
+namespace {
+
+struct Args {
+  std::string url = "https://127.0.0.1:8443/ping";
+  std::string url_alt;
+  int requests = 16;
+  int concurrency = 4;
+  int body_bytes = 0;
+  int h2_sessions = 2;
+  int h2_max_streams = 128;
+  int origin_waiters = 32;
+  int max_cached_origins = 4096;
+  int origin_cache_ttl_sec = 300;
+  int h2_failure_ttl_sec = 30;
+  int h1_shards = 0;
+  int h1_max_connections_per_origin = 0;
+  int h1_max_origins_per_shard = 4096;
+  int h1_origin_idle_ttl_sec = 300;
+  int h1_actor_connections_per_origin = 8;
+  int warmup_per_url = 0;
+  bool reset_connections_after_warmup = false;
+  bool concurrent_warmup = false;
+  bool sequential_warmup = false;
+  bool store_response = false;
+  bool insecure = false;
+  bool no_proxy = false;
+  bool strict_detect = false;
+  bool stripe_h1_origin_shards = false;
+  bool disable_lightweight_h1 = false;
+  bool h1_actor = false;
+  httpclient::ProtocolPolicy policy = httpclient::ProtocolPolicy::Auto;
+  bool mixed = false;
+  bool mixed_shuffle = false;
+  bool awaitable_mode = false;
+};
+
+Args parse_args(int argc, char** argv) {
+  Args args;
+  for (int i = 1; i < argc; ++i) {
+    std::string_view s(argv[i]);
+    auto next = [&](std::string_view key) { return i + 1 < argc && s == key; };
+    if (next("--url")) {
+      args.url = argv[++i];
+    } else if (next("--url-alt")) {
+      args.url_alt = argv[++i];
+    } else if (next("--requests")) {
+      args.requests = std::atoi(argv[++i]);
+    } else if (next("--concurrency")) {
+      args.concurrency = std::atoi(argv[++i]);
+    } else if (next("--body-bytes")) {
+      args.body_bytes = std::atoi(argv[++i]);
+    } else if (next("--h2-sessions")) {
+      args.h2_sessions = std::atoi(argv[++i]);
+    } else if (next("--h2-max-streams")) {
+      args.h2_max_streams = std::atoi(argv[++i]);
+    } else if (next("--origin-waiters")) {
+      args.origin_waiters = std::atoi(argv[++i]);
+    } else if (next("--max-cached-origins")) {
+      args.max_cached_origins = std::atoi(argv[++i]);
+    } else if (next("--origin-cache-ttl-sec")) {
+      args.origin_cache_ttl_sec = std::atoi(argv[++i]);
+    } else if (next("--h2-failure-ttl-sec")) {
+      args.h2_failure_ttl_sec = std::atoi(argv[++i]);
+    } else if (next("--h1-shards")) {
+      args.h1_shards = std::atoi(argv[++i]);
+    } else if (next("--h1-max-connections-per-origin")) {
+      args.h1_max_connections_per_origin = std::atoi(argv[++i]);
+    } else if (next("--h1-max-origins-per-shard")) {
+      args.h1_max_origins_per_shard = std::atoi(argv[++i]);
+    } else if (next("--h1-origin-idle-ttl-sec")) {
+      args.h1_origin_idle_ttl_sec = std::atoi(argv[++i]);
+    } else if (next("--h1-actor-connections")) {
+      args.h1_actor_connections_per_origin = std::atoi(argv[++i]);
+    } else if (next("--warmup-per-url")) {
+      args.warmup_per_url = std::atoi(argv[++i]);
+    } else if (s == "--reset-connections-after-warmup") {
+      args.reset_connections_after_warmup = true;
+    } else if (s == "--concurrent-warmup") {
+      args.concurrent_warmup = true;
+    } else if (s == "--sequential-warmup") {
+      args.sequential_warmup = true;
+    } else if (s == "--store-response") {
+      args.store_response = true;
+    } else if (s == "--insecure") {
+      args.insecure = true;
+    } else if (s == "--no-proxy") {
+      args.no_proxy = true;
+    } else if (s == "--strict-detect") {
+      args.strict_detect = true;
+    } else if (s == "--stripe-h1-origin-shards") {
+      args.stripe_h1_origin_shards = true;
+    } else if (s == "--disable-lightweight-h1") {
+      args.disable_lightweight_h1 = true;
+    } else if (s == "--h1-actor") {
+      args.h1_actor = true;
+    } else if (s == "--force-h1") {
+      args.policy = httpclient::ProtocolPolicy::ForceH1;
+    } else if (s == "--force-h2") {
+      args.policy = httpclient::ProtocolPolicy::ForceH2;
+    } else if (s == "--prefer-h1") {
+      args.policy = httpclient::ProtocolPolicy::PreferH1;
+    } else if (s == "--prefer-h2") {
+      args.policy = httpclient::ProtocolPolicy::PreferH2;
+    } else if (s == "--mixed") {
+      args.mixed = true;
+    } else if (s == "--mixed-shuffle") {
+      args.mixed = true;
+      args.mixed_shuffle = true;
+    } else if (s == "--awaitable") {
+      args.awaitable_mode = true;
+    }
+  }
+  return args;
+}
+
+bool mixed_uses_alt(int id, bool shuffle) {
+  if (!shuffle) {
+    return id % 2 == 1;
+  }
+  auto x = static_cast<std::uint64_t>(id) + 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  x = x ^ (x >> 31);
+  return (x & 1U) != 0;
+}
+
+httpclient::AsioHttpClient::Stats diff_stats(const httpclient::AsioHttpClient::Stats& after,
+                                             const httpclient::AsioHttpClient::Stats& before) {
+  return httpclient::AsioHttpClient::Stats{
+      after.h1_conn_created - before.h1_conn_created,
+      after.h1_idle_hit - before.h1_idle_hit,
+      after.h1_idle_miss - before.h1_idle_miss,
+      after.h1_conn_reused - before.h1_conn_reused,
+      after.h1_return_to_idle - before.h1_return_to_idle,
+      after.h1_close_after_response - before.h1_close_after_response,
+      after.h1_reuse_failed - before.h1_reuse_failed,
+      after.h1_reconnect_after_idle - before.h1_reconnect_after_idle,
+  };
+}
+
+httpclient::HttpClient::Stats diff_stats(
+    const httpclient::HttpClient::Stats& after,
+    const httpclient::HttpClient::Stats& before) {
+  httpclient::HttpClient::Stats out;
+  out.probe_h1_adopted = after.probe_h1_adopted - before.probe_h1_adopted;
+  out.probe_h2_marked = after.probe_h2_marked - before.probe_h2_marked;
+  out.probe_reconnect = after.probe_reconnect - before.probe_reconnect;
+  out.overflow_fallback = after.overflow_fallback - before.overflow_fallback;
+  out.overflow_fallback_on_h2_origin =
+      after.overflow_fallback_on_h2_origin - before.overflow_fallback_on_h2_origin;
+  out.url_route_cache_hits =
+      after.url_route_cache_hits - before.url_route_cache_hits;
+  out.url_route_cache_misses =
+      after.url_route_cache_misses - before.url_route_cache_misses;
+  out.h1_cached_routes = after.h1_cached_routes - before.h1_cached_routes;
+  out.h2_cached_routes = after.h2_cached_routes - before.h2_cached_routes;
+  out.detect_waiters = after.detect_waiters - before.detect_waiters;
+  out.detect_queue_overflow = after.detect_queue_overflow - before.detect_queue_overflow;
+  out.detect_overflow_to_h1 = after.detect_overflow_to_h1 - before.detect_overflow_to_h1;
+  out.detect_overflow_to_h1_later_h2 =
+      after.detect_overflow_to_h1_later_h2 - before.detect_overflow_to_h1_later_h2;
+  out.h1_pool = diff_stats(after.h1_pool, before.h1_pool);
+  out.h2_pool.streams_submitted =
+      after.h2_pool.streams_submitted - before.h2_pool.streams_submitted;
+  out.h2_pool.streams_completed =
+      after.h2_pool.streams_completed - before.h2_pool.streams_completed;
+  out.h2_pool.streams_timed_out =
+      after.h2_pool.streams_timed_out - before.h2_pool.streams_timed_out;
+  out.h2_pool.stream_slot_waits =
+      after.h2_pool.stream_slot_waits - before.h2_pool.stream_slot_waits;
+  out.h2_pool.max_active_streams = after.h2_pool.max_active_streams;
+  out.h2_pool.max_pending_stream_waiters =
+      after.h2_pool.max_pending_stream_waiters;
+  out.h2_pool.peer_max_concurrent_streams =
+      after.h2_pool.peer_max_concurrent_streams;
+  out.h2_pool.configured_max_concurrent_streams =
+      after.h2_pool.configured_max_concurrent_streams;
+  return out;
+}
+
+asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
+  struct State {
+    std::atomic<int> issued = 0;
+    std::atomic<int> ok = 0;
+    std::atomic<int> fail = 0;
+    std::atomic<int> h1 = 0;
+    std::atomic<int> h2 = 0;
+    std::atomic<int> completed = 0;
+  };
+
+  auto state = std::make_shared<State>();
+  auto payload = std::make_shared<std::string>(
+      static_cast<std::size_t>(std::max(0, args.body_bytes)), 'x');
+  auto ex = co_await asio::this_coro::executor;
+  auto done_timer = std::make_shared<asio::steady_timer>(ex);
+  done_timer->expires_at(asio::steady_timer::time_point::max());
+
+  auto urls = std::vector<std::string>{args.url};
+  if (args.mixed && !args.url_alt.empty()) {
+    urls.push_back(args.url_alt);
+  }
+
+  auto make_request = [&](const std::string& url) {
+    httpclient::Request req;
+    req.url = url;
+    req.method = payload->empty() ? "GET" : "POST";
+    req.body = *payload;
+    req.timeout_ms = 5000;
+    req.verify_peer = !args.insecure;
+    req.verify_host = !args.insecure;
+    req.disable_proxy = args.no_proxy;
+    req.measure_total_time = false;
+    req.protocol_policy = args.policy;
+    req.store_response_body = args.store_response;
+    req.store_response_headers = args.store_response;
+    return req;
+  };
+
+  if (args.warmup_per_url > 0 && args.concurrent_warmup) {
+    struct WarmupState {
+      std::atomic<int> issued = 0;
+      std::atomic<int> completed = 0;
+      std::atomic<int> printed = 0;
+    };
+    auto warmup_state = std::make_shared<WarmupState>();
+    auto warmup_done = std::make_shared<asio::steady_timer>(ex);
+    warmup_done->expires_at(asio::steady_timer::time_point::max());
+    auto warmup_one = std::make_shared<std::function<void()>>();
+    *warmup_one = [&, warmup_state, warmup_done, warmup_one]() {
+      auto id = warmup_state->issued.fetch_add(1);
+      auto total = args.warmup_per_url * static_cast<int>(urls.size());
+      if (id >= total) {
+        return;
+      }
+      const auto& url = urls[static_cast<std::size_t>(id % static_cast<int>(urls.size()))];
+      client.async_request_callback(
+          make_request(url),
+          [&, warmup_state, warmup_done, warmup_one](httpclient::Response resp) mutable {
+            if (!resp.error.empty() && warmup_state->printed.fetch_add(1) < 3) {
+              std::cerr << "warmup_error=" << resp.error << "\n";
+            }
+            if (warmup_state->completed.fetch_add(1) + 1 ==
+                args.warmup_per_url * static_cast<int>(urls.size())) {
+              warmup_done->cancel();
+            }
+            (*warmup_one)();
+          });
+    };
+    auto starters = std::min(args.concurrency,
+                             args.warmup_per_url * static_cast<int>(urls.size()));
+    for (int i = 0; i < starters; ++i) {
+      (*warmup_one)();
+    }
+    if (warmup_state->completed.load() <
+        args.warmup_per_url * static_cast<int>(urls.size())) {
+      boost::system::error_code ec;
+      co_await warmup_done->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+    }
+  } else if (args.warmup_per_url > 0 && args.sequential_warmup) {
+    for (int round = 0; round < args.warmup_per_url; ++round) {
+      for (const auto& url : urls) {
+        auto resp = co_await client.async_request(make_request(url));
+        if (!resp.error.empty()) {
+          std::cerr << "warmup_error=" << resp.error << "\n";
+        }
+      }
+    }
+  } else if (args.warmup_per_url > 0) {
+    std::cerr << "warmup_skipped=sequential_warmup_disabled\n";
+  }
+
+  if (args.reset_connections_after_warmup) {
+    co_await client.reset_connections();
+  }
+
+  auto stats_before = client.stats();
+  auto start = std::chrono::steady_clock::now();
+
+  auto handle_response = [&, state, done_timer, ex](httpclient::Response resp) {
+    if (resp.http_version == 1) {
+      state->h1.fetch_add(1);
+    } else if (resp.http_version == 3) {
+      state->h2.fetch_add(1);
+    }
+    if (resp.error.empty() && resp.status >= 200 && resp.status < 500) {
+      state->ok.fetch_add(1);
+    } else {
+      if (state->fail.load() < 3 && !resp.error.empty()) {
+        std::cerr << "error=" << resp.error << "\n";
+      }
+      state->fail.fetch_add(1);
+    }
+    if (state->completed.fetch_add(1) + 1 == args.requests) {
+      asio::post(ex, [done_timer] { done_timer->cancel(); });
+    }
+  };
+
+  if (!args.awaitable_mode) {
+    auto issue_one = std::make_shared<std::function<void()>>();
+    *issue_one = [&, state, payload, issue_one, handle_response]() {
+      auto id = state->issued.fetch_add(1);
+      if (id >= args.requests) {
+        return;
+      }
+      httpclient::Request req;
+      if (args.mixed && !args.url_alt.empty()) {
+        req.url = mixed_uses_alt(id, args.mixed_shuffle) ? args.url_alt : args.url;
+      } else {
+        req.url = args.url;
+      }
+      req.method = payload->empty() ? "GET" : "POST";
+      req.body = *payload;
+      req.timeout_ms = 5000;
+      req.verify_peer = !args.insecure;
+      req.verify_host = !args.insecure;
+      req.disable_proxy = args.no_proxy;
+      req.measure_total_time = false;
+      req.protocol_policy = args.policy;
+      req.store_response_body = args.store_response;
+      req.store_response_headers = args.store_response;
+      client.async_request_callback(
+          std::move(req),
+          [&, issue_one, handle_response](httpclient::Response resp) mutable {
+            handle_response(std::move(resp));
+            (*issue_one)();
+          });
+    };
+
+    auto starters = std::min(args.concurrency, args.requests);
+    for (int i = 0; i < starters; ++i) {
+      (*issue_one)();
+    }
+  } else {
+    auto issue_loop = [&, state, payload, done_timer]() -> asio::awaitable<void> {
+      for (int id = state->issued.fetch_add(1); id < args.requests;
+           id = state->issued.fetch_add(1)) {
+        httpclient::Request req = make_request(
+            (args.mixed && !args.url_alt.empty())
+                ? (mixed_uses_alt(id, args.mixed_shuffle) ? args.url_alt : args.url)
+                : args.url);
+        auto resp = co_await client.async_request(std::move(req));
+        if (resp.http_version == 1) {
+          state->h1.fetch_add(1);
+        } else if (resp.http_version == 3) {
+          state->h2.fetch_add(1);
+        }
+        if (resp.error.empty() && resp.status >= 200 && resp.status < 500) {
+          state->ok.fetch_add(1);
+        } else {
+          if (state->fail.load() < 3 && !resp.error.empty()) {
+            std::cerr << "error=" << resp.error << "\n";
+          }
+          state->fail.fetch_add(1);
+        }
+        if (state->completed.fetch_add(1) + 1 == args.requests) {
+          done_timer->cancel();
+        }
+      }
+    };
+
+    auto starters = std::min(args.concurrency, args.requests);
+    for (int i = 0; i < starters; ++i) {
+      asio::co_spawn(ex, issue_loop(), asio::detached);
+    }
+  }
+
+  if (state->completed.load() < args.requests) {
+    boost::system::error_code ec;
+    co_await done_timer->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+  }
+
+  auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count();
+  std::cout << "requests=" << args.requests << "\n";
+  std::cout << "ok=" << state->ok.load() << " fail=" << state->fail.load()
+            << " h1=" << state->h1.load() << " h2=" << state->h2.load() << "\n";
+  std::cout << "wall_ms=" << wall_ms << "\n";
+  auto stats = diff_stats(client.stats(), stats_before);
+  std::cout << "probe_h1_adopted=" << stats.probe_h1_adopted
+            << " probe_h2_marked=" << stats.probe_h2_marked
+            << " probe_reconnect=" << stats.probe_reconnect
+            << " overflow_fallback=" << stats.overflow_fallback
+            << " overflow_fallback_on_h2_origin=" << stats.overflow_fallback_on_h2_origin
+            << " url_route_cache_hits=" << stats.url_route_cache_hits
+            << " url_route_cache_misses=" << stats.url_route_cache_misses
+            << " h1_cached_routes=" << stats.h1_cached_routes
+            << " h2_cached_routes=" << stats.h2_cached_routes
+            << " detect_waiters=" << stats.detect_waiters
+            << " detect_queue_overflow=" << stats.detect_queue_overflow
+            << " detect_overflow_to_h1=" << stats.detect_overflow_to_h1
+            << " detect_overflow_to_h1_later_h2=" << stats.detect_overflow_to_h1_later_h2
+            << " h1_conn_created=" << stats.h1_pool.h1_conn_created
+            << " h1_idle_hit=" << stats.h1_pool.h1_idle_hit
+            << " h1_idle_miss=" << stats.h1_pool.h1_idle_miss
+            << " h1_conn_reused=" << stats.h1_pool.h1_conn_reused
+            << " h1_return_to_idle=" << stats.h1_pool.h1_return_to_idle
+            << " h1_close_after_response=" << stats.h1_pool.h1_close_after_response
+            << " h1_reuse_failed=" << stats.h1_pool.h1_reuse_failed
+            << " h1_reconnect_after_idle=" << stats.h1_pool.h1_reconnect_after_idle
+            << " h2_streams_submitted=" << stats.h2_pool.streams_submitted
+            << " h2_streams_completed=" << stats.h2_pool.streams_completed
+            << " h2_streams_timed_out=" << stats.h2_pool.streams_timed_out
+            << " h2_stream_slot_waits=" << stats.h2_pool.stream_slot_waits
+            << " h2_max_active_streams=" << stats.h2_pool.max_active_streams
+            << " h2_max_pending_stream_waiters="
+            << stats.h2_pool.max_pending_stream_waiters
+            << " h2_peer_max_streams=" << stats.h2_pool.peer_max_concurrent_streams
+            << " h2_configured_max_streams="
+            << stats.h2_pool.configured_max_concurrent_streams
+            << "\n";
+  client.shutdown();
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  asio::io_context io;
+  auto args = parse_args(argc, argv);
+  httpclient::HttpClient::Options options;
+  options.h1.enable_ssl_verify = !args.insecure;
+  options.h1.shard_count = static_cast<std::size_t>(std::max(0, args.h1_shards));
+  options.h1.max_connections_per_origin = static_cast<std::size_t>(
+      std::max(1, args.h1_max_connections_per_origin > 0
+                      ? args.h1_max_connections_per_origin
+                      : args.concurrency));
+  options.h1.max_origins_per_shard =
+      static_cast<std::size_t>(std::max(0, args.h1_max_origins_per_shard));
+  options.h1.origin_idle_ttl =
+      std::chrono::seconds(std::max(0, args.h1_origin_idle_ttl_sec));
+  options.h1.stripe_origins_across_shards = args.stripe_h1_origin_shards;
+  options.h1.use_lightweight_h1 = !args.disable_lightweight_h1;
+  options.h1.use_h1_connection_actor = args.h1_actor;
+  options.h1.h1_actor_connections_per_origin =
+      static_cast<std::size_t>(std::max(1, args.h1_actor_connections_per_origin));
+  options.h2.verify_tls = !args.insecure;
+  options.h2.sessions_per_origin =
+      static_cast<std::size_t>(std::max(1, args.h2_sessions));
+  options.h2.max_concurrent_streams =
+      static_cast<std::size_t>(std::max(1, args.h2_max_streams));
+  options.origin_waiter_limit =
+      static_cast<std::size_t>(std::max(0, args.origin_waiters));
+  options.max_cached_origins =
+      static_cast<std::size_t>(std::max(0, args.max_cached_origins));
+  options.origin_cache_ttl =
+      std::chrono::seconds(std::max(0, args.origin_cache_ttl_sec));
+  options.h2_failure_ttl =
+      std::chrono::seconds(std::max(0, args.h2_failure_ttl_sec));
+  options.detection_overflow_policy = args.strict_detect
+                                          ? httpclient::HttpClient::DetectionOverflowPolicy::WaitForDetection
+                                          : httpclient::HttpClient::DetectionOverflowPolicy::FallbackH1;
+  httpclient::HttpClient client(io, options);
+  asio::co_spawn(io, run(args, client), asio::detached);
+  io.run();
+  return 0;
+}
