@@ -1,3 +1,4 @@
+#include "asyncx/asyncx.hpp"
 #include "httpclient/http_client.hpp"
 
 #include <boost/asio/co_spawn.hpp>
@@ -14,15 +15,51 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <string_view>
 
 namespace asio = boost::asio;
 
 namespace {
+
+struct ProcessMemoryStats {
+  std::uint64_t rss_kb = 0;
+  std::uint64_t peak_rss_kb = 0;
+};
+
+ProcessMemoryStats read_process_memory_stats() {
+  ProcessMemoryStats stats;
+#if defined(__linux__)
+  FILE* file = std::fopen("/proc/self/status", "r");
+  if (!file) {
+    return stats;
+  }
+  char line[256];
+  while (std::fgets(line, sizeof(line), file)) {
+    std::string_view text(line);
+    auto colon = text.find(':');
+    if (colon == std::string_view::npos) {
+      continue;
+    }
+    auto key = text.substr(0, colon);
+    std::uint64_t value = 0;
+    std::istringstream input(std::string(text.substr(colon + 1)));
+    input >> value;
+    if (key == "VmRSS") {
+      stats.rss_kb = value;
+    } else if (key == "VmHWM") {
+      stats.peak_rss_kb = value;
+    }
+  }
+  std::fclose(file);
+#endif
+  return stats;
+}
 
 struct Args {
   std::string url = "https://127.0.0.1:8443/ping";
@@ -56,6 +93,7 @@ struct Args {
   bool mixed = false;
   bool mixed_shuffle = false;
   bool awaitable_mode = false;
+  bool gather_mode = false;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -132,6 +170,9 @@ Args parse_args(int argc, char** argv) {
       args.mixed_shuffle = true;
     } else if (s == "--awaitable") {
       args.awaitable_mode = true;
+    } else if (s == "--gather") {
+      args.gather_mode = true;
+      args.awaitable_mode = true;
     }
   }
   return args;
@@ -159,6 +200,9 @@ httpclient::AsioHttpClient::Stats diff_stats(const httpclient::AsioHttpClient::S
       after.h1_close_after_response - before.h1_close_after_response,
       after.h1_reuse_failed - before.h1_reuse_failed,
       after.h1_reconnect_after_idle - before.h1_reconnect_after_idle,
+      after.h1_cancelled - before.h1_cancelled,
+      after.h1_pool_wait_cancelled - before.h1_pool_wait_cancelled,
+      after.h1_close_on_cancel - before.h1_close_on_cancel,
   };
 }
 
@@ -190,8 +234,17 @@ httpclient::HttpClient::Stats diff_stats(
       after.h2_pool.streams_completed - before.h2_pool.streams_completed;
   out.h2_pool.streams_timed_out =
       after.h2_pool.streams_timed_out - before.h2_pool.streams_timed_out;
+  out.h2_pool.streams_cancelled =
+      after.h2_pool.streams_cancelled - before.h2_pool.streams_cancelled;
   out.h2_pool.stream_slot_waits =
       after.h2_pool.stream_slot_waits - before.h2_pool.stream_slot_waits;
+  out.h2_pool.stream_slot_wait_cancelled =
+      after.h2_pool.stream_slot_wait_cancelled -
+      before.h2_pool.stream_slot_wait_cancelled;
+  out.h2_pool.connect_waits =
+      after.h2_pool.connect_waits - before.h2_pool.connect_waits;
+  out.h2_pool.connect_wait_cancelled =
+      after.h2_pool.connect_wait_cancelled - before.h2_pool.connect_wait_cancelled;
   out.h2_pool.max_active_streams = after.h2_pool.max_active_streams;
   out.h2_pool.max_pending_stream_waiters =
       after.h2_pool.max_pending_stream_waiters;
@@ -199,6 +252,15 @@ httpclient::HttpClient::Stats diff_stats(
       after.h2_pool.peer_max_concurrent_streams;
   out.h2_pool.configured_max_concurrent_streams =
       after.h2_pool.configured_max_concurrent_streams;
+  out.h2_pool.session_groups = after.h2_pool.session_groups;
+  out.h2_pool.session_groups_evicted =
+      after.h2_pool.session_groups_evicted - before.h2_pool.session_groups_evicted;
+  out.h2_pool.session_group_cache_hits =
+      after.h2_pool.session_group_cache_hits -
+      before.h2_pool.session_group_cache_hits;
+  out.h2_pool.session_group_cache_misses =
+      after.h2_pool.session_group_cache_misses -
+      before.h2_pool.session_group_cache_misses;
   return out;
 }
 
@@ -250,16 +312,17 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     auto warmup_done = std::make_shared<asio::steady_timer>(ex);
     warmup_done->expires_at(asio::steady_timer::time_point::max());
     auto warmup_one = std::make_shared<std::function<void()>>();
-    *warmup_one = [&, warmup_state, warmup_done, warmup_one]() {
+    std::weak_ptr<std::function<void()>> weak_warmup_one = warmup_one;
+    *warmup_one = [&, warmup_state, warmup_done, weak_warmup_one]() {
       auto id = warmup_state->issued.fetch_add(1);
       auto total = args.warmup_per_url * static_cast<int>(urls.size());
       if (id >= total) {
         return;
       }
-      const auto& url = urls[static_cast<std::size_t>(id % static_cast<int>(urls.size()))];
+      auto url = urls[static_cast<std::size_t>(id % static_cast<int>(urls.size()))];
       client.async_request_callback(
           make_request(url),
-          [&, warmup_state, warmup_done, warmup_one](httpclient::Response resp) mutable {
+          [&, warmup_state, warmup_done, weak_warmup_one](httpclient::Response resp) mutable {
             if (!resp.error.empty() && warmup_state->printed.fetch_add(1) < 3) {
               std::cerr << "warmup_error=" << resp.error << "\n";
             }
@@ -267,7 +330,9 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
                 args.warmup_per_url * static_cast<int>(urls.size())) {
               warmup_done->cancel();
             }
-            (*warmup_one)();
+            if (auto warmup_one = weak_warmup_one.lock()) {
+              (*warmup_one)();
+            }
           });
     };
     auto starters = std::min(args.concurrency,
@@ -319,40 +384,64 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     }
   };
 
-  if (!args.awaitable_mode) {
-    auto issue_one = std::make_shared<std::function<void()>>();
-    *issue_one = [&, state, payload, issue_one, handle_response]() {
+  auto make_indexed_request = [&](int id) {
+    httpclient::Request req = make_request(
+        (args.mixed && !args.url_alt.empty())
+            ? (mixed_uses_alt(id, args.mixed_shuffle) ? args.url_alt : args.url)
+            : args.url);
+    return req;
+  };
+
+  auto handle_response_no_timer = [&, state](httpclient::Response resp) {
+    if (resp.http_version == 1) {
+      state->h1.fetch_add(1);
+    } else if (resp.http_version == 3) {
+      state->h2.fetch_add(1);
+    }
+    if (resp.error.empty() && resp.status >= 200 && resp.status < 500) {
+      state->ok.fetch_add(1);
+    } else {
+      if (state->fail.load() < 3 && !resp.error.empty()) {
+        std::cerr << "error=" << resp.error << "\n";
+      }
+      state->fail.fetch_add(1);
+    }
+    state->completed.fetch_add(1);
+  };
+
+  std::shared_ptr<std::function<void()>> callback_issue_one;
+  if (args.gather_mode) {
+    co_await asyncx::for_each_limited(
+        static_cast<std::size_t>(args.requests),
+        static_cast<std::size_t>(args.concurrency),
+        [&](std::size_t id) {
+          return client.async_request(make_indexed_request(static_cast<int>(id)));
+        },
+        [&](std::size_t, httpclient::Response resp) {
+          handle_response_no_timer(std::move(resp));
+        });
+  } else if (!args.awaitable_mode) {
+    callback_issue_one = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak_issue_one = callback_issue_one;
+    *callback_issue_one = [&, state, payload, weak_issue_one, handle_response]() {
       auto id = state->issued.fetch_add(1);
       if (id >= args.requests) {
         return;
       }
-      httpclient::Request req;
-      if (args.mixed && !args.url_alt.empty()) {
-        req.url = mixed_uses_alt(id, args.mixed_shuffle) ? args.url_alt : args.url;
-      } else {
-        req.url = args.url;
-      }
-      req.method = payload->empty() ? "GET" : "POST";
-      req.body = *payload;
-      req.timeout_ms = 5000;
-      req.verify_peer = !args.insecure;
-      req.verify_host = !args.insecure;
-      req.disable_proxy = args.no_proxy;
-      req.measure_total_time = false;
-      req.protocol_policy = args.policy;
-      req.store_response_body = args.store_response;
-      req.store_response_headers = args.store_response;
+      auto req = make_indexed_request(id);
       client.async_request_callback(
           std::move(req),
-          [&, issue_one, handle_response](httpclient::Response resp) mutable {
+          [weak_issue_one, handle_response](httpclient::Response resp) mutable {
             handle_response(std::move(resp));
-            (*issue_one)();
+            if (auto issue_one = weak_issue_one.lock()) {
+              (*issue_one)();
+            }
           });
     };
 
     auto starters = std::min(args.concurrency, args.requests);
     for (int i = 0; i < starters; ++i) {
-      (*issue_one)();
+      (*callback_issue_one)();
     }
   } else {
     auto issue_loop = [&, state, payload, done_timer]() -> asio::awaitable<void> {
@@ -396,10 +485,13 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - start)
                      .count();
+  auto mem = read_process_memory_stats();
   std::cout << "requests=" << args.requests << "\n";
   std::cout << "ok=" << state->ok.load() << " fail=" << state->fail.load()
             << " h1=" << state->h1.load() << " h2=" << state->h2.load() << "\n";
   std::cout << "wall_ms=" << wall_ms << "\n";
+  std::cout << "rss_kb=" << mem.rss_kb << " peak_rss_kb=" << mem.peak_rss_kb
+            << "\n";
   auto stats = diff_stats(client.stats(), stats_before);
   std::cout << "probe_h1_adopted=" << stats.probe_h1_adopted
             << " probe_h2_marked=" << stats.probe_h2_marked
@@ -422,16 +514,32 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
             << " h1_close_after_response=" << stats.h1_pool.h1_close_after_response
             << " h1_reuse_failed=" << stats.h1_pool.h1_reuse_failed
             << " h1_reconnect_after_idle=" << stats.h1_pool.h1_reconnect_after_idle
+            << " h1_cancelled=" << stats.h1_pool.h1_cancelled
+            << " h1_pool_wait_cancelled=" << stats.h1_pool.h1_pool_wait_cancelled
+            << " h1_close_on_cancel=" << stats.h1_pool.h1_close_on_cancel
             << " h2_streams_submitted=" << stats.h2_pool.streams_submitted
             << " h2_streams_completed=" << stats.h2_pool.streams_completed
             << " h2_streams_timed_out=" << stats.h2_pool.streams_timed_out
+            << " h2_streams_cancelled=" << stats.h2_pool.streams_cancelled
             << " h2_stream_slot_waits=" << stats.h2_pool.stream_slot_waits
+            << " h2_stream_slot_wait_cancelled="
+            << stats.h2_pool.stream_slot_wait_cancelled
+            << " h2_connect_waits=" << stats.h2_pool.connect_waits
+            << " h2_connect_wait_cancelled="
+            << stats.h2_pool.connect_wait_cancelled
             << " h2_max_active_streams=" << stats.h2_pool.max_active_streams
             << " h2_max_pending_stream_waiters="
             << stats.h2_pool.max_pending_stream_waiters
             << " h2_peer_max_streams=" << stats.h2_pool.peer_max_concurrent_streams
             << " h2_configured_max_streams="
             << stats.h2_pool.configured_max_concurrent_streams
+            << " h2_session_groups=" << stats.h2_pool.session_groups
+            << " h2_session_groups_evicted="
+            << stats.h2_pool.session_groups_evicted
+            << " h2_session_group_cache_hits="
+            << stats.h2_pool.session_group_cache_hits
+            << " h2_session_group_cache_misses="
+            << stats.h2_pool.session_group_cache_misses
             << "\n";
   client.shutdown();
 }
@@ -444,10 +552,10 @@ int main(int argc, char** argv) {
   httpclient::HttpClient::Options options;
   options.h1.enable_ssl_verify = !args.insecure;
   options.h1.shard_count = static_cast<std::size_t>(std::max(0, args.h1_shards));
-  options.h1.max_connections_per_origin = static_cast<std::size_t>(
-      std::max(1, args.h1_max_connections_per_origin > 0
-                      ? args.h1_max_connections_per_origin
-                      : args.concurrency));
+  if (args.h1_max_connections_per_origin > 0) {
+    options.h1.max_connections_per_origin = static_cast<std::size_t>(
+        std::max(1, args.h1_max_connections_per_origin));
+  }
   options.h1.max_origins_per_shard =
       static_cast<std::size_t>(std::max(0, args.h1_max_origins_per_shard));
   options.h1.origin_idle_ttl =

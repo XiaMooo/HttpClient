@@ -10,7 +10,7 @@ DELAY_MS="${DELAY_MS:-5}"
 RESPONSE_BYTES="${RESPONSE_BYTES:-1024}"
 H2_PORT="${H2_PORT:-8643}"
 H1_PORT="${H1_PORT:-8645}"
-H2_SESSIONS="${H2_SESSIONS:-2}"
+H2_SESSIONS="${H2_SESSIONS:-4}"
 H2_MAX_STREAMS="${H2_MAX_STREAMS:-128}"
 ORIGIN_WAITERS="${ORIGIN_WAITERS:-128}"
 MAX_CACHED_ORIGINS="${MAX_CACHED_ORIGINS:-4096}"
@@ -101,7 +101,7 @@ fi
 
 for body_bytes in $BODY_CASES; do
   echo "== body_bytes=$body_bytes =="
-  echo "-- cpp httpclient"
+  echo "-- cpp httpclient callback"
   "$ROOT_DIR/build-$PRESET/httpclient_bench" \
     --mixed --mixed-shuffle \
     --url "$H2_URL" \
@@ -126,11 +126,52 @@ for body_bytes in $BODY_CASES; do
     --h1-actor-connections "$H1_ACTOR_CONNECTIONS" \
     "${h1_extra_args[@]}"
 
-  echo "-- go net/http"
+  echo "-- cpp httpclient asyncx gather"
+  "$ROOT_DIR/build-$PRESET/httpclient_bench" \
+    --mixed --mixed-shuffle \
+    --gather \
+    --url "$H2_URL" \
+    --url-alt "$H1_URL" \
+    --requests "$REQUESTS" \
+    --concurrency "$CONCURRENCY" \
+    --body-bytes "$body_bytes" \
+    --warmup-per-url "$WARMUP_PER_URL" \
+    "${warmup_args[@]}" \
+    --insecure --no-proxy \
+    "${strict_args[@]}" \
+    --h2-sessions "$H2_SESSIONS" \
+    --h2-max-streams "$H2_MAX_STREAMS" \
+    --origin-waiters "$ORIGIN_WAITERS" \
+    --max-cached-origins "$MAX_CACHED_ORIGINS" \
+    --origin-cache-ttl-sec "$ORIGIN_CACHE_TTL_SEC" \
+    --h2-failure-ttl-sec "$H2_FAILURE_TTL_SEC" \
+    --h1-shards "$H1_SHARDS" \
+    --h1-max-connections-per-origin "$H1_MAX_CONNECTIONS_PER_ORIGIN" \
+    --h1-max-origins-per-shard "$H1_MAX_ORIGINS_PER_SHARD" \
+    --h1-origin-idle-ttl-sec "$H1_ORIGIN_IDLE_TTL_SEC" \
+    --h1-actor-connections "$H1_ACTOR_CONNECTIONS" \
+    "${h1_extra_args[@]}"
+
+  echo "-- go net/http worker"
   (
     cd "$ROOT_DIR"
     go run tools/go_compare/bench_client.go \
       --mixed --mixed-shuffle \
+      --url "$H2_URL" \
+      --url-alt "$H1_URL" \
+      --requests "$REQUESTS" \
+      --concurrency "$CONCURRENCY" \
+      --body-bytes "$body_bytes" \
+      --warmup-per-url "$WARMUP_PER_URL" \
+      --insecure --no-proxy
+  )
+
+  echo "-- go net/http gather"
+  (
+    cd "$ROOT_DIR"
+    go run tools/go_compare/bench_client.go \
+      --mixed --mixed-shuffle \
+      --gather \
       --url "$H2_URL" \
       --url-alt "$H1_URL" \
       --requests "$REQUESTS" \

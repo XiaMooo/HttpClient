@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -33,8 +34,8 @@ func main() {
 	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		_ = r.Body.Close()
-		if delayMs > 0 {
-			time.Sleep(time.Duration(delayMs) * time.Millisecond)
+		if requestDelayMs := delayForRequest(r, delayMs); requestDelayMs > 0 {
+			time.Sleep(time.Duration(requestDelayMs) * time.Millisecond)
 		}
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write(fixedBody(responseBytes))
@@ -42,13 +43,48 @@ func main() {
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		_ = r.Body.Close()
+		if requestDelayMs := delayForRequest(r, delayMs); requestDelayMs > 0 {
+			time.Sleep(time.Duration(requestDelayMs) * time.Millisecond)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"method":       r.Method,
-			"content_type": r.Header.Get("Content-Type"),
-			"accept":       r.Header.Get("Accept"),
-			"body":         string(body),
+			"method":        r.Method,
+			"content_type":  r.Header.Get("Content-Type"),
+			"accept":        r.Header.Get("Accept"),
+			"authorization": r.Header.Get("Authorization"),
+			"cookie":        r.Header.Get("Cookie"),
+			"query":         r.URL.RawQuery,
+			"proxy":         r.Header.Get("X-Proxy-Used"),
+			"proxy_auth":    r.Header.Get("Proxy-Authorization"),
+			"body":          string(body),
 		})
+	})
+	mux.HandleFunc("/redirect", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/echo", http.StatusFound)
+	})
+	mux.HandleFunc("/set-cookie", func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("name")
+		value := r.URL.Query().Get("value")
+		if name == "" {
+			name = "session"
+		}
+		if value == "" {
+			value = "abc"
+		}
+		http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: "/"})
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/status/500", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("error"))
+	})
+	mux.HandleFunc("/gzip", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "text/plain")
+		gz := gzip.NewWriter(w)
+		_, _ = gz.Write([]byte("compressed response"))
+		_ = gz.Close()
 	})
 
 	srv := &http.Server{
@@ -70,6 +106,18 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Fatal(srv.Serve(ln))
+}
+
+func delayForRequest(r *http.Request, fallback int) int {
+	value := r.URL.Query().Get("delay_ms")
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
 }
 
 func fixedBody(n int) []byte {

@@ -1,6 +1,8 @@
 #include "httpclient/h2_client.hpp"
+#include "proxy_support.hpp"
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/detached.hpp>
@@ -25,7 +27,9 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -127,6 +131,31 @@ bool h2_skip_header(std::string_view name) {
          header_name_equals(name, "content-length");
 }
 
+std::string transport_key(const ParsedUrl& url,
+                          const proxy_support::EffectiveProxy& proxy) {
+  std::string key = url.scheme + "://" + url.host + ":" + url.port;
+  if (!proxy.enabled) {
+    key.append("|direct");
+    return key;
+  }
+  key.append("|proxy=");
+  key.append(proxy.url.scheme);
+  key.append("://");
+  key.append(proxy.url.username);
+  key.push_back('@');
+  key.append(proxy.url.host);
+  key.push_back(':');
+  key.append(proxy.url.port);
+  if (!proxy.authorization.empty()) {
+    key.append("|auth=");
+    key.append(std::to_string(std::hash<std::string>{}(proxy.authorization)));
+  } else if (!proxy.url.password.empty()) {
+    key.append("|auth=socks5:");
+    key.append(std::to_string(std::hash<std::string>{}(proxy.url.password)));
+  }
+  return key;
+}
+
 long parse_status(const uint8_t* value, size_t len) {
   long status = 0;
   for (size_t i = 0; i < len; ++i) {
@@ -143,6 +172,7 @@ long parse_status(const uint8_t* value, size_t len) {
 
 struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   using Stream = ssl::stream<tcp::socket>;
+  using NestedStream = ssl::stream<ssl::stream<tcp::socket>>;
 
   explicit Impl(asio::io_context& io, Options options)
       : io_(io),
@@ -165,7 +195,11 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     std::atomic<std::uint64_t> streams_submitted{0};
     std::atomic<std::uint64_t> streams_completed{0};
     std::atomic<std::uint64_t> streams_timed_out{0};
+    std::atomic<std::uint64_t> streams_cancelled{0};
     std::atomic<std::uint64_t> stream_slot_waits{0};
+    std::atomic<std::uint64_t> stream_slot_wait_cancelled{0};
+    std::atomic<std::uint64_t> connect_waits{0};
+    std::atomic<std::uint64_t> connect_wait_cancelled{0};
     std::atomic<std::uint64_t> max_active_streams{0};
     std::atomic<std::uint64_t> max_pending_stream_waiters{0};
   };
@@ -174,6 +208,24 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     auto current = target.load(std::memory_order_relaxed);
     while (current < value &&
            !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {}
+  }
+
+  static std::chrono::milliseconds effective_timeout(
+      const Request& request, long Request::Timeout::*field) {
+    auto value = request.timeout.*field;
+    if (value < 0) {
+      value = request.timeout.total_ms >= 0 ? request.timeout.total_ms
+                                            : request.timeout_ms;
+    }
+    if (value < 0) {
+      value = request.timeout_ms;
+    }
+    return std::chrono::milliseconds(value);
+  }
+
+  static void set_h2_alpn(SSL* handle) {
+    static const unsigned char alpn[] = {2, 'h', '2'};
+    SSL_set_alpn_protos(handle, alpn, sizeof(alpn));
   }
 
   struct StreamState {
@@ -186,12 +238,24 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     bool done = false;
     bool store_body = true;
     bool store_headers = true;
+    BodyChunkHandler on_body_chunk;
     bool callback_mode = false;
     BodySource body_source;
     bool has_body_source = false;
     std::chrono::steady_clock::time_point deadline{};
+    std::chrono::steady_clock::time_point write_deadline{};
+    std::chrono::steady_clock::time_point read_deadline{};
+    std::chrono::milliseconds write_timeout{0};
+    std::chrono::milliseconds read_timeout{0};
+    bool response_started = false;
     std::chrono::steady_clock::time_point start{};
     H2Client::ResponseHandler handler;
+  };
+
+  enum class DeadlineKind : unsigned char {
+    Total,
+    Write,
+    Read,
   };
 
   struct StreamEntry {
@@ -203,6 +267,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   struct DeadlineEntry {
     std::chrono::steady_clock::time_point deadline{};
     int32_t stream_id = 0;
+    DeadlineKind kind = DeadlineKind::Total;
 
     bool operator>(const DeadlineEntry& other) const {
       return deadline > other.deadline;
@@ -242,90 +307,189 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     ~ConnectingGuard() {
       if (armed) {
         self.connecting_ = false;
+        self.notify_connect_waiters();
       }
     }
     void dismiss() { armed = false; }
   };
 
+  struct Waiter {
+    explicit Waiter(asio::any_io_executor executor) : timer(std::move(executor)) {}
+    asio::steady_timer timer;
+    bool woken = false;
+    bool cancelled = false;
+  };
+
+  using WaiterPtr = std::shared_ptr<Waiter>;
+  using WaiterQueue = std::deque<WaiterPtr>;
+
+  static void remove_waiter(WaiterQueue& queue, const WaiterPtr& waiter) {
+    queue.erase(std::remove(queue.begin(), queue.end(), waiter), queue.end());
+  }
+
+  static void wake_waiter(const WaiterPtr& waiter) {
+    if (!waiter || waiter->cancelled) {
+      return;
+    }
+    waiter->woken = true;
+    waiter->timer.cancel();
+  }
+
   asio::awaitable<void> ensure_connected(const ParsedUrl& url, bool insecure) {
+    auto proxy = proxy_support::proxy_for_request(current_request_);
     if (connected_) {
       co_return;
     }
     if (connecting_) {
-      asio::steady_timer timer(strand_);
-      while (!connected_ && connecting_) {
-        timer.expires_after(std::chrono::milliseconds(1));
-        co_await timer.async_wait(asio::use_awaitable);
+      ++stats_.connect_waits;
+      auto waiter = std::make_shared<Waiter>(strand_);
+      waiter->timer.expires_at(asio::steady_timer::time_point::max());
+      connect_waiters_.push_back(waiter);
+      boost::system::error_code ec;
+      co_await waiter->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+      if (ec == asio::error::operation_aborted && !waiter->woken) {
+        waiter->cancelled = true;
+        remove_waiter(connect_waiters_, waiter);
+        ++stats_.connect_wait_cancelled;
+        throw std::runtime_error("h2 connect wait cancelled");
       }
       if (connected_) {
         co_return;
       }
+      if (!connect_error_.empty()) {
+        throw std::runtime_error(connect_error_);
+      }
+      throw std::runtime_error("h2 connect failed");
     }
-    connecting_ = true;
-    ConnectingGuard guard{*this};
-    insecure_ = insecure;
-    if (!callbacks_) {
-      nghttp2_session_callbacks_new(&callbacks_);
-      nghttp2_session_callbacks_set_on_header_callback(callbacks_, &Impl::on_header);
-      nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks_,
-                                                                &Impl::on_data);
-      nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks_, &Impl::on_frame);
+    if (goaway_received_) {
+      close_connection("h2 goaway");
     }
-    if (!session_) {
-      nghttp2_session_client_new(&session_, callbacks_, this);
-      streams_.reserve(std::max<std::size_t>(256, options_.max_concurrent_streams * 2));
-      state_waiters_.reserve(std::max<std::size_t>(256, options_.max_concurrent_streams * 2));
+    if (connected_) {
+      co_return;
     }
+    try {
+      connect_error_.clear();
+      ++io_generation_;
+      connecting_ = true;
+      ConnectingGuard guard{*this};
+      insecure_ = insecure;
+      if (!callbacks_) {
+        nghttp2_session_callbacks_new(&callbacks_);
+        nghttp2_session_callbacks_set_on_header_callback(callbacks_, &Impl::on_header);
+        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks_,
+                                                                  &Impl::on_data);
+        nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks_, &Impl::on_frame);
+      }
+      if (!session_) {
+        nghttp2_session_client_new(&session_, callbacks_, this);
+        streams_.reserve(std::max<std::size_t>(256, options_.max_concurrent_streams * 2));
+        stream_index_.reserve(std::max<std::size_t>(256, options_.max_concurrent_streams * 2));
+        state_waiters_.reserve(std::max<std::size_t>(256, options_.max_concurrent_streams * 2));
+      }
 
-    static const unsigned char alpn[] = {2, 'h', '2'};
-    SSL_CTX_set_alpn_protos(ssl_ctx_.native_handle(), alpn, sizeof(alpn));
-    if (options_.verify_tls && !insecure) {
-      ssl_ctx_.set_default_verify_paths();
-    } else {
-      ssl_ctx_.set_verify_mode(ssl::verify_none);
+      if (options_.verify_tls && !insecure) {
+        ssl_ctx_.set_default_verify_paths();
+      } else {
+        ssl_ctx_.set_verify_mode(ssl::verify_none);
+      }
+
+      tcp::resolver resolver(strand_);
+      const auto& connect_host = proxy.enabled ? proxy.url.host : url.host;
+      const auto& connect_port = proxy.enabled ? proxy.url.port : url.port;
+      auto endpoints = co_await resolver.async_resolve(connect_host, connect_port,
+                                                       asio::use_awaitable);
+      if (proxy.enabled && proxy.scheme == proxy_support::Scheme::Https) {
+        nested_stream_ =
+            std::make_unique<NestedStream>(Stream(strand_, ssl_ctx_), ssl_ctx_);
+        if (insecure || !options_.verify_tls) {
+          nested_stream_->next_layer().set_verify_mode(ssl::verify_none);
+          nested_stream_->set_verify_mode(ssl::verify_none);
+        }
+        if (!SSL_set_tlsext_host_name(
+                nested_stream_->next_layer().native_handle(),
+                proxy.url.host.c_str())) {
+          throw std::runtime_error("HTTPS proxy SNI setup failed");
+        }
+        if (!SSL_set_tlsext_host_name(nested_stream_->native_handle(),
+                                      url.host.c_str())) {
+          throw std::runtime_error("SNI setup failed");
+        }
+        co_await asio::async_connect(nested_stream_->next_layer().next_layer(),
+                                     endpoints, asio::use_awaitable);
+        boost::system::error_code option_ec;
+        nested_stream_->next_layer().next_layer().set_option(tcp::no_delay(true),
+                                                             option_ec);
+        co_await nested_stream_->next_layer().async_handshake(
+            ssl::stream_base::client, asio::use_awaitable);
+        co_await proxy_support::establish_http_connect_tunnel(
+            nested_stream_->next_layer(), url.host, url.port, proxy.authorization);
+        set_h2_alpn(nested_stream_->native_handle());
+        co_await nested_stream_->async_handshake(ssl::stream_base::client,
+                                                 asio::use_awaitable);
+      } else {
+        stream_ = std::make_unique<Stream>(strand_, ssl_ctx_);
+        if (insecure || !options_.verify_tls) {
+          stream_->set_verify_mode(ssl::verify_none);
+        }
+        if (!SSL_set_tlsext_host_name(stream_->native_handle(), url.host.c_str())) {
+          throw std::runtime_error("SNI setup failed");
+        }
+        set_h2_alpn(stream_->native_handle());
+        co_await asio::async_connect(stream_->next_layer(), endpoints,
+                                     asio::use_awaitable);
+        boost::system::error_code option_ec;
+        stream_->next_layer().set_option(tcp::no_delay(true), option_ec);
+        if (proxy.enabled) {
+          if (proxy.scheme == proxy_support::Scheme::Socks5) {
+            co_await proxy_support::establish_socks5_tunnel(
+                stream_->next_layer(), url.host, url.port, proxy.url);
+          } else {
+            co_await proxy_support::establish_http_connect_tunnel(
+                stream_->next_layer(), url.host, url.port, proxy.authorization);
+          }
+        }
+        co_await stream_->async_handshake(ssl::stream_base::client,
+                                          asio::use_awaitable);
+      }
+
+      const unsigned char* selected = nullptr;
+      unsigned int selected_len = 0;
+      SSL_get0_alpn_selected(active_native_handle(), &selected, &selected_len);
+      if (selected_len != 2 || std::memcmp(selected, "h2", 2) != 0) {
+        throw std::runtime_error("server did not negotiate h2");
+      }
+
+      nghttp2_settings_entry iv[] = {
+          {NGHTTP2_SETTINGS_ENABLE_PUSH, 0},
+          {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1000},
+      };
+      nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, 2);
+      pump_output();
+      connected_ = true;
+      connecting_ = false;
+      guard.dismiss();
+      notify_connect_waiters();
+
+      auto generation = io_generation_;
+      reading_ = true;
+      auto self = shared_from_this();
+      asio::co_spawn(
+          strand_,
+          [self, generation]() -> asio::awaitable<void> {
+            co_await self->read_loop(generation);
+          },
+          asio::detached);
+      } catch (const std::exception& e) {
+      connect_error_ = e.what();
+      close_connection(connect_error_);
+      connecting_ = false;
+      if (connect_error_ == "Operation canceled" ||
+          connect_error_ == "operation_aborted") {
+        ++stats_.connect_wait_cancelled;
+      }
+      notify_connect_waiters();
+      throw;
     }
-
-    stream_ = std::make_unique<Stream>(strand_, ssl_ctx_);
-    if (insecure || !options_.verify_tls) {
-      stream_->set_verify_mode(ssl::verify_none);
-    }
-    if (!SSL_set_tlsext_host_name(stream_->native_handle(), url.host.c_str())) {
-      throw std::runtime_error("SNI setup failed");
-    }
-
-    tcp::resolver resolver(strand_);
-    auto endpoints = co_await resolver.async_resolve(url.host, url.port,
-                                                     asio::use_awaitable);
-    co_await asio::async_connect(stream_->next_layer(), endpoints, asio::use_awaitable);
-    boost::system::error_code option_ec;
-    stream_->next_layer().set_option(tcp::no_delay(true), option_ec);
-    co_await stream_->async_handshake(ssl::stream_base::client, asio::use_awaitable);
-
-    const unsigned char* selected = nullptr;
-    unsigned int selected_len = 0;
-    SSL_get0_alpn_selected(stream_->native_handle(), &selected, &selected_len);
-    if (selected_len != 2 || std::memcmp(selected, "h2", 2) != 0) {
-      throw std::runtime_error("server did not negotiate h2");
-    }
-
-    nghttp2_settings_entry iv[] = {
-        {NGHTTP2_SETTINGS_ENABLE_PUSH, 0},
-        {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1000},
-    };
-    nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, iv, 2);
-    pump_output();
-    connected_ = true;
-    connecting_ = false;
-    guard.dismiss();
-
-    auto generation = io_generation_;
-    auto self = shared_from_this();
-    asio::co_spawn(
-        strand_,
-        [self, generation]() -> asio::awaitable<void> {
-          co_await self->read_loop(generation);
-        },
-        asio::detached);
   }
 
   asio::awaitable<Response> get(std::string url_text, bool insecure) {
@@ -337,9 +501,12 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
 
   asio::awaitable<Response> async_request(Request request, bool insecure) {
     auto self = shared_from_this();
+    co_await asio::this_coro::reset_cancellation_state(
+        asio::enable_total_cancellation());
+    auto cancel_state = co_await asio::this_coro::cancellation_state;
     co_return co_await asio::co_spawn(
         strand_, self->request_on_strand(std::move(request), insecure),
-        asio::use_awaitable);
+        asio::bind_cancellation_slot(cancel_state.slot(), asio::use_awaitable));
   }
 
   void async_request_callback(Request request, H2Client::ResponseHandler handler,
@@ -352,8 +519,11 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
           auto start = std::chrono::steady_clock::now();
           try {
             auto url = parse_url(request.url);
+            self->current_request_ = request;
             co_await self->ensure_connected(url, insecure);
-            auto slot = co_await self->acquire_stream_slot();
+            self->current_request_ = Request{};
+            auto slot = co_await self->acquire_stream_slot(
+                effective_timeout(request, &Request::Timeout::pool_ms));
             auto stream_id = self->submit_stream(std::move(request), url, start);
             auto* stream = self->find_stream(stream_id);
             if (stream == nullptr) {
@@ -363,6 +533,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
             stream->handler = std::move(handler);
             slot.dismiss();
           } catch (const std::exception& e) {
+            self->current_request_ = Request{};
             Response response;
             response.error = e.what();
             response.total_time_sec =
@@ -379,8 +550,11 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     auto start = std::chrono::steady_clock::now();
     try {
       auto url = parse_url(request.url);
+      current_request_ = request;
       co_await ensure_connected(url, insecure);
-      auto slot = co_await acquire_stream_slot();
+      current_request_ = Request{};
+      auto slot = co_await acquire_stream_slot(
+          effective_timeout(request, &Request::Timeout::pool_ms));
       auto stream_id = submit_stream(std::move(request), url, start);
       auto* state = find_stream(stream_id);
       if (state == nullptr) {
@@ -388,19 +562,21 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       }
 
       if (!state->done) {
-        auto waiter = std::make_shared<asio::steady_timer>(strand_);
-        waiter->expires_at(asio::steady_timer::time_point::max());
+        auto waiter = std::make_shared<Waiter>(strand_);
+        waiter->timer.expires_at(asio::steady_timer::time_point::max());
         state_waiters_[stream_id] = waiter;
         boost::system::error_code ec;
-        co_await waiter->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        co_await waiter->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
         state_waiters_.erase(stream_id);
+        if (ec == asio::error::operation_aborted && !waiter->woken) {
+          cancel_stream(stream_id, "h2 stream cancelled");
+          slot.release();
+          throw std::runtime_error("h2 stream cancelled");
+        }
       }
       state = find_stream(stream_id);
       if (state == nullptr || !state->done) {
-        nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE, stream_id,
-                                  NGHTTP2_CANCEL);
-        pump_output();
-        erase_stream(stream_id);
+        cancel_stream(stream_id, "h2 stream timeout");
         slot.release();
         throw std::runtime_error("h2 stream timeout");
       }
@@ -414,6 +590,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       ++stats_.streams_completed;
       co_return response;
     } catch (const std::exception& e) {
+      current_request_ = Request{};
       Response response;
       response.error = e.what();
       response.total_time_sec =
@@ -424,6 +601,10 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
 
   int32_t submit_stream(Request request, const ParsedUrl& url,
                         std::chrono::steady_clock::time_point start) {
+    if (goaway_received_) {
+      close_connection("h2 goaway");
+      throw std::runtime_error("h2 goaway retry");
+    }
     std::string content_length;
     const std::string_view method =
         request.method.empty() ? std::string_view("GET")
@@ -490,10 +671,12 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       throw std::runtime_error(nghttp2_strerror(stream_id));
     }
     if (stream_id != expected_stream_id) {
-      auto it = find_stream_it(expected_stream_id);
-      if (it != streams_.end()) {
-        it->id = stream_id;
-        state = &it->state;
+      auto* entry = find_stream_entry(expected_stream_id);
+      if (entry != nullptr) {
+        stream_index_.erase(expected_stream_id);
+        entry->id = stream_id;
+        stream_index_[stream_id] = static_cast<std::size_t>(entry - streams_.data());
+        state = &entry->state;
       } else {
         state = &acquire_stream_entry(stream_id).state;
       }
@@ -501,44 +684,72 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     ++stats_.streams_submitted;
     state->store_body = request.store_response_body;
     state->store_headers = request.store_response_headers;
-    state->deadline = std::chrono::steady_clock::now() +
-                      std::chrono::milliseconds(request.timeout_ms);
+    state->on_body_chunk = std::move(request.on_body_chunk);
+    const auto now = std::chrono::steady_clock::now();
+    auto total_timeout =
+        effective_timeout(request, &Request::Timeout::total_ms);
+    auto write_timeout =
+        effective_timeout(request, &Request::Timeout::write_ms);
+    auto read_timeout =
+        effective_timeout(request, &Request::Timeout::read_ms);
+    state->deadline = now + total_timeout;
+    state->write_timeout = write_timeout;
+    state->read_timeout = read_timeout;
+    state->write_deadline = now + write_timeout;
+    state->read_deadline = std::chrono::steady_clock::time_point::max();
     state->start = start;
-    deadline_heap_.push_back(DeadlineEntry{state->deadline, stream_id});
-    std::push_heap(deadline_heap_.begin(), deadline_heap_.end(),
-                   std::greater<DeadlineEntry>{});
+    add_deadline(stream_id, DeadlineKind::Total, state->deadline);
+    add_deadline(stream_id, DeadlineKind::Write, state->write_deadline);
     pump_output();
     arm_deadline_timer();
     return stream_id;
   }
 
   void complete_stream(int32_t stream_id) {
-    auto it = find_stream_it(stream_id);
-    if (it == streams_.end()) {
+    auto* entry = find_stream_entry(stream_id);
+    if (entry == nullptr) {
       return;
     }
-    it->state.done = true;
-    if (!it->state.callback_mode) {
+    entry->state.done = true;
+    if (!entry->state.callback_mode) {
       auto waiter = state_waiters_.find(stream_id);
       if (waiter != state_waiters_.end() && waiter->second) {
-        waiter->second->cancel();
+        wake_waiter(waiter->second);
       }
       return;
     }
 
-    auto response = std::move(it->state.response);
+    auto response = std::move(entry->state.response);
     response.total_time_sec =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      it->state.start)
+                                      entry->state.start)
             .count();
     response.http_version = 3;
-    auto handler = std::move(it->state.handler);
-    release_stream_entry(it);
+    auto handler = std::move(entry->state.handler);
+    release_stream_entry(stream_id);
     release_stream_slot();
     ++stats_.streams_completed;
     if (handler) {
       handler(std::move(response));
     }
+  }
+
+  void cancel_stream(int32_t stream_id, const char* reason) {
+    auto* stream = find_stream(stream_id);
+    if (stream == nullptr) {
+      return;
+    }
+    stream->response.error = reason;
+    stream->done = true;
+    ++stats_.streams_cancelled;
+    nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE, stream_id,
+                              NGHTTP2_CANCEL);
+    auto waiter = state_waiters_.find(stream_id);
+    if (waiter != state_waiters_.end() && waiter->second) {
+      wake_waiter(waiter->second);
+    }
+    erase_stream(stream_id);
+    pump_output();
   }
 
   std::size_t stream_limit() const {
@@ -547,7 +758,9 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     return std::min(configured, peer);
   }
 
-  asio::awaitable<StreamSlot> acquire_stream_slot() {
+  asio::awaitable<StreamSlot> acquire_stream_slot(
+      std::chrono::milliseconds pool_timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + pool_timeout;
     for (;;) {
       if (stopping_) {
         throw std::runtime_error("h2 shutdown");
@@ -558,12 +771,25 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
         co_return StreamSlot{this, true};
       }
       ++stats_.stream_slot_waits;
-      auto waiter = std::make_shared<asio::steady_timer>(strand_);
-      waiter->expires_at(asio::steady_timer::time_point::max());
+      auto waiter = std::make_shared<Waiter>(strand_);
+      waiter->timer.expires_at(pool_timeout.count() > 0
+                                   ? deadline
+                                   : asio::steady_timer::time_point::max());
       stream_waiters_.push_back(waiter);
       update_max(stats_.max_pending_stream_waiters, stream_waiters_.size());
       boost::system::error_code ec;
-      co_await waiter->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+      co_await waiter->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+      if (ec == asio::error::operation_aborted && !waiter->woken) {
+        waiter->cancelled = true;
+        remove_waiter(stream_waiters_, waiter);
+        ++stats_.stream_slot_wait_cancelled;
+        throw std::runtime_error("h2 stream slot wait cancelled");
+      }
+      if (ec != asio::error::operation_aborted &&
+          pool_timeout.count() > 0 &&
+          std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("h2 stream slot timeout");
+      }
     }
   }
 
@@ -574,12 +800,22 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     wake_stream_waiters();
   }
 
+  void add_deadline(int32_t stream_id, DeadlineKind kind,
+                    std::chrono::steady_clock::time_point deadline) {
+    if (deadline == std::chrono::steady_clock::time_point::max()) {
+      return;
+    }
+    deadline_heap_.push_back(DeadlineEntry{deadline, stream_id, kind});
+    std::push_heap(deadline_heap_.begin(), deadline_heap_.end(),
+                   std::greater<DeadlineEntry>{});
+  }
+
   void wake_stream_waiters() {
     while (!stream_waiters_.empty() && active_streams_ < stream_limit()) {
       auto waiter = std::move(stream_waiters_.front());
       stream_waiters_.pop_front();
-      if (waiter) {
-        waiter->cancel();
+      if (waiter && !waiter->cancelled) {
+        wake_waiter(waiter);
         return;
       }
     }
@@ -616,26 +852,29 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
                     std::greater<DeadlineEntry>{});
       deadline_heap_.pop_back();
       auto stream_id = entry.stream_id;
-      auto it = find_stream_it(stream_id);
-      if (it == streams_.end() || it->state.done ||
-          it->state.deadline != entry.deadline) {
+      auto* stream = find_stream(stream_id);
+      if (stream == nullptr || stream->done) {
+        continue;
+      }
+      const auto current_deadline = deadline_for(*stream, entry.kind);
+      if (current_deadline != entry.deadline) {
         continue;
       }
       expired_any = true;
-      it->state.response.error = "h2 stream timeout";
-      it->state.done = true;
+      stream->response.error = timeout_message(entry.kind);
+      stream->done = true;
       ++stats_.streams_timed_out;
       nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE, stream_id,
                                 NGHTTP2_CANCEL);
-      if (it->state.callback_mode) {
-        auto response = std::move(it->state.response);
+      if (stream->callback_mode) {
+        auto response = std::move(stream->response);
         response.total_time_sec =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                          it->state.start)
+                                          stream->start)
                 .count();
         response.http_version = 3;
-        auto handler = std::move(it->state.handler);
-        release_stream_entry(it);
+        auto handler = std::move(stream->handler);
+        release_stream_entry(stream_id);
         release_stream_slot();
         if (handler) {
           handler(std::move(response));
@@ -644,7 +883,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       }
       auto waiter = state_waiters_.find(stream_id);
       if (waiter != state_waiters_.end() && waiter->second) {
-        waiter->second->cancel();
+        wake_waiter(waiter->second);
       }
     }
     if (expired_any) {
@@ -655,10 +894,12 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   void prune_deadline_heap() {
     while (!deadline_heap_.empty()) {
       auto& entry = deadline_heap_.front();
-      auto it = find_stream_it(entry.stream_id);
-      if (it != streams_.end() && !it->state.done &&
-          it->state.deadline == entry.deadline) {
-        return;
+      auto* stream = find_stream(entry.stream_id);
+      if (stream != nullptr && !stream->done) {
+        const auto current_deadline = deadline_for(*stream, entry.kind);
+        if (current_deadline == entry.deadline) {
+          return;
+        }
       }
       std::pop_heap(deadline_heap_.begin(), deadline_heap_.end(),
                     std::greater<DeadlineEntry>{});
@@ -666,8 +907,33 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     }
   }
 
+  static std::chrono::steady_clock::time_point deadline_for(
+      const StreamState& state, DeadlineKind kind) {
+    switch (kind) {
+      case DeadlineKind::Total:
+        return state.deadline;
+      case DeadlineKind::Write:
+        return state.write_deadline;
+      case DeadlineKind::Read:
+        return state.read_deadline;
+    }
+    return state.deadline;
+  }
+
+  static const char* timeout_message(DeadlineKind kind) {
+    switch (kind) {
+      case DeadlineKind::Total:
+        return "h2 stream timeout";
+      case DeadlineKind::Write:
+        return "h2 write timeout";
+      case DeadlineKind::Read:
+        return "h2 read timeout";
+    }
+    return "h2 stream timeout";
+  }
+
   void pump_output() {
-    if (stopping_ || !stream_) {
+    if (stopping_ || !has_active_stream()) {
       return;
     }
     const uint8_t* data = nullptr;
@@ -696,7 +962,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
 
   asio::awaitable<void> write_loop(std::uint64_t generation) {
     try {
-      while (!stopping_ && generation == io_generation_ && stream_) {
+      while (!stopping_ && generation == io_generation_ && has_active_stream()) {
         if (active_write_buffer_.empty()) {
           active_write_buffer_.swap(pending_write_buffer_);
         }
@@ -705,12 +971,11 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
           co_return;
         }
         boost::system::error_code ec;
-        co_await asio::async_write(
-            *stream_, asio::buffer(active_write_buffer_),
-            asio::redirect_error(asio::use_awaitable, ec));
+        co_await async_write_active(asio::buffer(active_write_buffer_), ec);
         if (ec) {
           if (generation != io_generation_ && ec == asio::error::operation_aborted) {
             writing_ = false;
+            release_closed_streams();
             co_return;
           }
           throw boost::system::system_error(ec);
@@ -722,20 +987,22 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       shutdown_now();
     }
     writing_ = false;
+    release_closed_streams();
   }
 
   asio::awaitable<void> read_loop(std::uint64_t generation) {
     std::array<uint8_t, 16384> buf{};
     try {
       for (;;) {
-        if (stopping_ || generation != io_generation_ || !stream_) {
+        if (stopping_ || generation != io_generation_ || !has_active_stream()) {
           break;
         }
         boost::system::error_code ec;
-        std::size_t n = co_await stream_->async_read_some(
-            asio::buffer(buf), asio::redirect_error(asio::use_awaitable, ec));
+        std::size_t n = co_await async_read_some_active(asio::buffer(buf), ec);
         if (ec) {
           if (generation != io_generation_ && ec == asio::error::operation_aborted) {
+            reading_ = false;
+            release_closed_streams();
             co_return;
           }
           throw boost::system::system_error(ec);
@@ -750,6 +1017,8 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       fail_all_streams("h2 read failed");
       shutdown_now();
     }
+    reading_ = false;
+    release_closed_streams();
   }
 
   static int on_header(nghttp2_session*, const nghttp2_frame* frame,
@@ -763,6 +1032,15 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     auto* stream = self->find_stream(frame->hd.stream_id);
     if (stream == nullptr) {
       return 0;
+    }
+    stream->response_started = true;
+    stream->write_deadline = std::chrono::steady_clock::time_point::max();
+    if (stream->read_timeout.count() > 0) {
+      stream->read_deadline =
+          std::chrono::steady_clock::now() + stream->read_timeout;
+      self->add_deadline(frame->hd.stream_id, DeadlineKind::Read,
+                         stream->read_deadline);
+      self->arm_deadline_timer();
     }
     if (header_name_equals(name, namelen, ":status")) {
       stream->response.status = parse_status(value, valuelen);
@@ -781,8 +1059,21 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
                      const uint8_t* data, size_t len, void* user_data) {
     auto* self = static_cast<Impl*>(user_data);
     auto* stream = self->find_stream(stream_id);
-    if (stream != nullptr && stream->store_body) {
-      stream->response.body.append(reinterpret_cast<const char*>(data), len);
+    if (stream != nullptr) {
+      stream->response_started = true;
+      if (stream->read_timeout.count() > 0) {
+        stream->read_deadline =
+            std::chrono::steady_clock::now() + stream->read_timeout;
+        self->add_deadline(stream_id, DeadlineKind::Read, stream->read_deadline);
+        self->arm_deadline_timer();
+      }
+      if (stream->on_body_chunk && len > 0) {
+        stream->on_body_chunk(std::string_view(
+            reinterpret_cast<const char*>(data), len));
+      }
+      if (stream->store_body) {
+        stream->response.body.append(reinterpret_cast<const char*>(data), len);
+      }
     }
     return 0;
   }
@@ -823,6 +1114,14 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     if ((frame->hd.type == NGHTTP2_DATA || frame->hd.type == NGHTTP2_HEADERS) &&
         (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
       self->complete_stream(frame->hd.stream_id);
+    } else if (frame->hd.type == NGHTTP2_RST_STREAM) {
+      auto* stream = self->find_stream(frame->hd.stream_id);
+      if (stream != nullptr) {
+        stream->response.error = "h2 stream reset";
+      }
+      self->complete_stream(frame->hd.stream_id);
+    } else if (frame->hd.type == NGHTTP2_GOAWAY) {
+      self->goaway_received_ = true;
     }
     return 0;
   }
@@ -843,20 +1142,17 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   }
 
   void shutdown_now() {
-    if (stopping_ && !stream_) {
+    if (stopping_ && !has_active_stream()) {
       return;
     }
     stopping_ = true;
-    if (stream_) {
-      boost::system::error_code ec;
-      stream_->lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
-      stream_->lowest_layer().close(ec);
-    }
+    close_active_stream();
     active_write_buffer_.clear();
     pending_write_buffer_.clear();
     writing_ = false;
     connected_ = false;
     connecting_ = false;
+    goaway_received_ = false;
     active_streams_ = 0;
     deadline_heap_.clear();
     deadline_timer_.cancel();
@@ -874,17 +1170,13 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   }
 
   void close_connection(const std::string& error) {
-    if (stream_) {
-      boost::system::error_code ec;
-      stream_->lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
-      stream_->lowest_layer().close(ec);
-      stream_.reset();
-    }
+    close_active_stream();
     active_write_buffer_.clear();
     pending_write_buffer_.clear();
     writing_ = false;
     connected_ = false;
     connecting_ = false;
+    goaway_received_ = false;
     active_streams_ = 0;
     deadline_heap_.clear();
     deadline_timer_.cancel();
@@ -898,12 +1190,81 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     peer_max_concurrent_streams_ = 100;
   }
 
+  bool has_active_stream() const {
+    return stream_ != nullptr || nested_stream_ != nullptr;
+  }
+
+  SSL* active_native_handle() {
+    if (nested_stream_) {
+      return nested_stream_->native_handle();
+    }
+    if (stream_) {
+      return stream_->native_handle();
+    }
+    return nullptr;
+  }
+
+  template <class ConstBufferSequence>
+  asio::awaitable<void> async_write_active(const ConstBufferSequence& buffers,
+                                           boost::system::error_code& ec) {
+    if (nested_stream_) {
+      co_await asio::async_write(
+          *nested_stream_, buffers, asio::redirect_error(asio::use_awaitable, ec));
+      co_return;
+    }
+    co_await asio::async_write(
+        *stream_, buffers, asio::redirect_error(asio::use_awaitable, ec));
+  }
+
+  template <class MutableBufferSequence>
+  asio::awaitable<std::size_t> async_read_some_active(
+      const MutableBufferSequence& buffers, boost::system::error_code& ec) {
+    if (nested_stream_) {
+      co_return co_await nested_stream_->async_read_some(
+          buffers, asio::redirect_error(asio::use_awaitable, ec));
+    }
+    co_return co_await stream_->async_read_some(
+        buffers, asio::redirect_error(asio::use_awaitable, ec));
+  }
+
+  void close_active_stream() {
+    boost::system::error_code ec;
+    if (nested_stream_) {
+      nested_stream_->lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
+      nested_stream_->lowest_layer().close(ec);
+      retired_nested_streams_.push_back(std::move(nested_stream_));
+    }
+    if (stream_) {
+      stream_->lowest_layer().shutdown(tcp::socket::shutdown_both, ec);
+      stream_->lowest_layer().close(ec);
+      retired_streams_.push_back(std::move(stream_));
+    }
+  }
+
+  void release_closed_streams() {
+    if (reading_ || writing_) {
+      return;
+    }
+    retired_nested_streams_.clear();
+    retired_streams_.clear();
+  }
+
   void wake_all_stream_waiters() {
     while (!stream_waiters_.empty()) {
       auto waiter = std::move(stream_waiters_.front());
       stream_waiters_.pop_front();
-      if (waiter) {
-        waiter->cancel();
+      if (waiter && !waiter->cancelled) {
+        wake_waiter(waiter);
+      }
+    }
+  }
+
+  void notify_connect_waiters() {
+    while (!connect_waiters_.empty()) {
+      auto waiter = std::move(connect_waiters_.front());
+      connect_waiters_.pop_front();
+      if (waiter && !waiter->cancelled) {
+        wake_waiter(waiter);
       }
     }
   }
@@ -929,7 +1290,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       }
       auto waiter = state_waiters_.find(entry.id);
       if (waiter != state_waiters_.end() && waiter->second) {
-        waiter->second->cancel();
+        wake_waiter(waiter->second);
       }
     }
     for (auto stream_id : callback_streams) {
@@ -946,19 +1307,25 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     }
   }
 
-  std::vector<StreamEntry>::iterator find_stream_it(int32_t stream_id) {
-    return std::find_if(streams_.begin(), streams_.end(),
-                        [stream_id](const StreamEntry& entry) {
-                          return entry.in_use && entry.id == stream_id;
-                        });
+  StreamEntry* find_stream_entry(int32_t stream_id) {
+    auto index = stream_index_.find(stream_id);
+    if (index == stream_index_.end() || index->second >= streams_.size()) {
+      return nullptr;
+    }
+    auto& entry = streams_[index->second];
+    if (!entry.in_use || entry.id != stream_id) {
+      stream_index_.erase(index);
+      return nullptr;
+    }
+    return &entry;
   }
 
   StreamState* find_stream(int32_t stream_id) {
-    auto it = find_stream_it(stream_id);
-    if (it == streams_.end()) {
+    auto* entry = find_stream_entry(stream_id);
+    if (entry == nullptr) {
       return nullptr;
     }
-    return &it->state;
+    return &entry->state;
   }
 
   void erase_stream(int32_t stream_id) {
@@ -971,26 +1338,29 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
         entry.id = stream_id;
         entry.in_use = true;
         entry.state = StreamState{};
+        stream_index_[stream_id] =
+            static_cast<std::size_t>(&entry - streams_.data());
         return entry;
       }
     }
     streams_.push_back(StreamEntry{stream_id, true, StreamState{}});
+    stream_index_[stream_id] = streams_.size() - 1;
     return streams_.back();
   }
 
   void release_stream_entry(int32_t stream_id) {
-    auto it = find_stream_it(stream_id);
-    if (it != streams_.end()) {
-      release_stream_entry(it);
+    auto* entry = find_stream_entry(stream_id);
+    if (entry != nullptr) {
+      stream_index_.erase(stream_id);
+      entry->state = StreamState{};
+      entry->id = 0;
+      entry->in_use = false;
     }
   }
 
-  void release_stream_entry(std::vector<StreamEntry>::iterator it) {
-    if (it != streams_.end()) {
-      it->state = StreamState{};
-      it->id = 0;
-      it->in_use = false;
-    }
+  bool idle() const {
+    return !connecting_ && active_streams_ == 0 && stream_waiters_.empty() &&
+           state_waiters_.empty();
   }
 
   asio::io_context& io_;
@@ -1004,18 +1374,27 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   bool stopping_ = false;
   std::uint64_t io_generation_ = 0;
   std::unique_ptr<Stream> stream_;
+  std::unique_ptr<NestedStream> nested_stream_;
+  std::vector<std::unique_ptr<Stream>> retired_streams_;
+  std::vector<std::unique_ptr<NestedStream>> retired_nested_streams_;
+  Request current_request_;
+  std::string connect_error_;
   nghttp2_session_callbacks* callbacks_ = nullptr;
   nghttp2_session* session_ = nullptr;
   std::vector<StreamEntry> streams_;
-  std::unordered_map<int32_t, std::shared_ptr<asio::steady_timer>> state_waiters_;
+  std::unordered_map<int32_t, std::size_t> stream_index_;
+  std::unordered_map<int32_t, WaiterPtr> state_waiters_;
   std::vector<DeadlineEntry> deadline_heap_;
   std::vector<uint8_t> active_write_buffer_;
   std::vector<uint8_t> pending_write_buffer_;
-  std::deque<std::shared_ptr<asio::steady_timer>> stream_waiters_;
+  WaiterQueue connect_waiters_;
+  WaiterQueue stream_waiters_;
   std::size_t active_streams_ = 0;
   std::size_t peer_max_concurrent_streams_ = 100;
   bool deadline_timer_armed_ = false;
   bool writing_ = false;
+  bool reading_ = false;
+  bool goaway_received_ = false;
   Counters stats_;
 };
 
@@ -1028,15 +1407,135 @@ void H2Client::Impl::StreamSlot::release() {
 
 H2Client::H2Client(asio::io_context& io) : H2Client(io, Options{}) {}
 
-H2Client::H2Client(asio::io_context& io, Options options) {
-  auto n = std::max<std::size_t>(1, options.sessions_per_origin);
-  impls_.reserve(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    impls_.push_back(std::make_shared<Impl>(io, options));
+struct H2Client::SessionGroup {
+  std::vector<std::shared_ptr<Impl>> impls;
+  std::atomic<std::size_t> next{0};
+  std::chrono::steady_clock::time_point last_used{};
+  std::list<std::string>::iterator lru_it;
+  bool lru_linked = false;
+};
+
+H2Client::H2Client(asio::io_context& io, Options options)
+    : io_(io), options_(options) {}
+
+H2Client::~H2Client() = default;
+
+bool H2Client::session_group_idle(const SessionGroup& group) const {
+  return std::all_of(group.impls.begin(), group.impls.end(),
+                     [](const std::shared_ptr<Impl>& impl) {
+                       return impl && impl->idle();
+                     });
+}
+
+void H2Client::evict_session_groups_locked() {
+  const auto max_groups = options_.max_session_groups;
+  if (max_groups == 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  const auto ttl = options_.session_group_idle_ttl;
+  auto expired = [&](const SessionGroup& group) {
+    return ttl.count() > 0 && now - group.last_used >= ttl;
+  };
+
+  for (auto it = group_lru_.rbegin(); it != group_lru_.rend();) {
+    auto map_it = groups_.find(*it);
+    if (map_it == groups_.end()) {
+      auto erase_it = std::next(it).base();
+      it = std::make_reverse_iterator(group_lru_.erase(erase_it));
+      continue;
+    }
+    auto& group = *map_it->second;
+    if (session_group_idle(group) &&
+        (expired(group) || groups_.size() >= max_groups)) {
+      for (auto& impl : group.impls) {
+        if (impl) {
+          impl->request_shutdown();
+        }
+      }
+      group.lru_linked = false;
+      auto erase_it = std::next(it).base();
+      it = std::make_reverse_iterator(group_lru_.erase(erase_it));
+      groups_.erase(map_it);
+      session_groups_evicted_.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    if (groups_.size() < max_groups) {
+      break;
+    }
+    ++it;
   }
 }
 
-H2Client::~H2Client() = default;
+std::shared_ptr<H2Client::SessionGroup> H2Client::group_for(const Request& request) {
+  auto url = parse_url(request.url);
+  auto proxy = proxy_support::proxy_for_request(request);
+  auto key = transport_key(url, proxy);
+  struct LocalEntry {
+    const H2Client* owner = nullptr;
+    std::string key;
+    std::weak_ptr<SessionGroup> group;
+  };
+  thread_local std::array<LocalEntry, 32> local_cache{};
+  thread_local std::size_t local_cursor = 0;
+  for (auto& entry : local_cache) {
+    if (entry.owner == this && entry.key == key) {
+      if (auto group = entry.group.lock()) {
+        session_group_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+        if (groups_mu_.try_lock()) {
+          std::lock_guard<std::mutex> lock(groups_mu_, std::adopt_lock);
+          auto it = groups_.find(key);
+          if (it != groups_.end() && it->second == group) {
+            group->last_used = std::chrono::steady_clock::now();
+            if (group->lru_linked) {
+              group_lru_.splice(group_lru_.begin(), group_lru_, group->lru_it);
+            }
+          } else {
+            entry = LocalEntry{};
+          }
+        }
+        if (entry.owner == this) {
+          return group;
+        }
+      }
+      entry = LocalEntry{};
+      break;
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(groups_mu_);
+  auto it = groups_.find(key);
+  if (it != groups_.end()) {
+    session_group_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+    it->second->last_used = std::chrono::steady_clock::now();
+    if (it->second->lru_linked) {
+      group_lru_.splice(group_lru_.begin(), group_lru_, it->second->lru_it);
+    }
+    auto& entry = local_cache[local_cursor++ % local_cache.size()];
+    entry.owner = this;
+    entry.key = key;
+    entry.group = it->second;
+    return it->second;
+  }
+  session_group_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+  evict_session_groups_locked();
+  auto group = std::make_shared<SessionGroup>();
+  auto n = std::max<std::size_t>(1, options_.sessions_per_origin);
+  group->impls.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    group->impls.push_back(std::make_shared<Impl>(io_, options_));
+  }
+  group->last_used = std::chrono::steady_clock::now();
+  group_lru_.push_front(key);
+  group->lru_it = group_lru_.begin();
+  group->lru_linked = true;
+  groups_.emplace(key, group);
+  auto& entry = local_cache[local_cursor++ % local_cache.size()];
+  entry.owner = this;
+  entry.key = key;
+  entry.group = group;
+  return group;
+}
 
 asio::awaitable<Response> H2Client::get(std::string url, bool insecure) {
   Request request;
@@ -1046,47 +1545,77 @@ asio::awaitable<Response> H2Client::get(std::string url, bool insecure) {
 }
 
 asio::awaitable<Response> H2Client::async_request(Request request, bool insecure) {
-  auto idx = next_impl_.fetch_add(1, std::memory_order_relaxed) % impls_.size();
-  co_return co_await impls_[idx]->async_request(std::move(request), insecure);
+  auto group = group_for(request);
+  auto idx = group->next.fetch_add(1, std::memory_order_relaxed) %
+             group->impls.size();
+  co_return co_await group->impls[idx]->async_request(std::move(request), insecure);
 }
 
 void H2Client::async_request_callback(Request request, ResponseHandler handler,
                                       bool insecure) {
-  auto idx = next_impl_.fetch_add(1, std::memory_order_relaxed) % impls_.size();
-  impls_[idx]->async_request_callback(std::move(request), std::move(handler), insecure);
+  auto group = group_for(request);
+  auto idx = group->next.fetch_add(1, std::memory_order_relaxed) %
+             group->impls.size();
+  group->impls[idx]->async_request_callback(std::move(request), std::move(handler),
+                                            insecure);
 }
 
 H2Client::Stats H2Client::stats() const {
   Stats out;
-  for (const auto& impl : impls_) {
-    out.streams_submitted += impl->stats_.streams_submitted.load();
-    out.streams_completed += impl->stats_.streams_completed.load();
-    out.streams_timed_out += impl->stats_.streams_timed_out.load();
-    out.stream_slot_waits += impl->stats_.stream_slot_waits.load();
-    out.max_active_streams =
-        std::max<std::uint64_t>(out.max_active_streams,
-                                impl->stats_.max_active_streams.load());
-    out.max_pending_stream_waiters =
-        std::max<std::uint64_t>(out.max_pending_stream_waiters,
-                                impl->stats_.max_pending_stream_waiters.load());
-    out.peer_max_concurrent_streams =
-        std::max<std::uint64_t>(out.peer_max_concurrent_streams,
-                                impl->peer_max_concurrent_streams_);
-    out.configured_max_concurrent_streams =
-        std::max<std::uint64_t>(out.configured_max_concurrent_streams,
-                                impl->options_.max_concurrent_streams);
+  std::lock_guard<std::mutex> lock(groups_mu_);
+  out.session_groups = groups_.size();
+  out.session_groups_evicted =
+      session_groups_evicted_.load(std::memory_order_relaxed);
+  out.session_group_cache_hits =
+      session_group_cache_hits_.load(std::memory_order_relaxed);
+  out.session_group_cache_misses =
+      session_group_cache_misses_.load(std::memory_order_relaxed);
+  for (const auto& [_, group] : groups_) {
+    for (const auto& impl : group->impls) {
+      out.streams_submitted += impl->stats_.streams_submitted.load();
+      out.streams_completed += impl->stats_.streams_completed.load();
+      out.streams_timed_out += impl->stats_.streams_timed_out.load();
+      out.streams_cancelled += impl->stats_.streams_cancelled.load();
+      out.stream_slot_waits += impl->stats_.stream_slot_waits.load();
+      out.stream_slot_wait_cancelled +=
+          impl->stats_.stream_slot_wait_cancelled.load();
+      out.connect_waits += impl->stats_.connect_waits.load();
+      out.connect_wait_cancelled += impl->stats_.connect_wait_cancelled.load();
+      out.max_active_streams =
+          std::max<std::uint64_t>(out.max_active_streams,
+                                  impl->stats_.max_active_streams.load());
+      out.max_pending_stream_waiters =
+          std::max<std::uint64_t>(out.max_pending_stream_waiters,
+                                  impl->stats_.max_pending_stream_waiters.load());
+      out.peer_max_concurrent_streams =
+          std::max<std::uint64_t>(out.peer_max_concurrent_streams,
+                                  impl->peer_max_concurrent_streams_);
+      out.configured_max_concurrent_streams =
+          std::max<std::uint64_t>(out.configured_max_concurrent_streams,
+                                  impl->options_.max_concurrent_streams);
+    }
   }
   return out;
 }
 
 void H2Client::shutdown() {
-  for (auto& impl : impls_) {
-    impl->request_shutdown();
+  std::lock_guard<std::mutex> lock(groups_mu_);
+  for (auto& [_, group] : groups_) {
+    for (auto& impl : group->impls) {
+      impl->request_shutdown();
+    }
   }
 }
 
 asio::awaitable<void> H2Client::reset_connections() {
-  for (auto& impl : impls_) {
+  std::vector<std::shared_ptr<Impl>> impls;
+  {
+    std::lock_guard<std::mutex> lock(groups_mu_);
+    for (auto& [_, group] : groups_) {
+      impls.insert(impls.end(), group->impls.begin(), group->impls.end());
+    }
+  }
+  for (auto& impl : impls) {
     co_await impl->reset();
   }
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +28,18 @@ func main() {
 		_ = json.NewEncoder(w).Encode(payload{
 			Message: "pong",
 			Now:     time.Now().UTC().Format(time.RFC3339Nano),
+		})
+	})
+	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"method":       r.Method,
+			"content_type": r.Header.Get("Content-Type"),
+			"proxy":        r.Header.Get("X-Proxy-Used"),
+			"proxy_auth":   r.Header.Get("Proxy-Authorization"),
+			"body":         string(body),
 		})
 	})
 
@@ -58,4 +71,3 @@ func getenvInt(key string, def int) int {
 	}
 	return n
 }
-

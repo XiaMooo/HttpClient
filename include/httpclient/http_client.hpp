@@ -8,7 +8,12 @@
 
 #include <chrono>
 #include <functional>
+#include <future>
 #include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace httpclient {
 
@@ -26,6 +31,24 @@ public:
     std::size_t origin_waiter_limit = 32;
     std::size_t max_cached_origins = 4096;
     std::chrono::seconds origin_cache_ttl{300};
+    bool follow_redirects = false;
+    int max_redirects = 20;
+    int max_retries = 0;
+    std::chrono::milliseconds retry_backoff{0};
+    std::vector<int> retry_statuses{429, 502, 503, 504};
+    bool enable_cookie_jar = false;
+    std::size_t max_cookie_domains = 1024;
+    std::size_t max_cookies_per_domain = 64;
+    bool auto_decompress = false;
+    Request::Timeout timeout;
+    std::optional<ProxyConfig> proxy;
+    bool trust_env_proxy = false;
+    std::vector<std::string> no_proxy;
+    std::vector<std::string> default_headers;
+    std::vector<QueryParam> default_query_params;
+    std::string base_url;
+    std::vector<std::function<void(Request&)>> request_hooks;
+    std::vector<std::function<void(Response&)>> response_hooks;
     DetectionOverflowPolicy detection_overflow_policy =
         DetectionOverflowPolicy::FallbackH1;
   };
@@ -48,6 +71,8 @@ public:
     H2Client::Stats h2_pool;
   };
 
+  HttpClient();
+  explicit HttpClient(Options options);
   explicit HttpClient(boost::asio::io_context& io);
   HttpClient(boost::asio::io_context& io, Options options);
   ~HttpClient();
@@ -58,7 +83,23 @@ public:
   using ResponseHandler = std::function<void(Response)>;
 
   boost::asio::awaitable<Response> async_request(Request request);
+  boost::asio::awaitable<Response> async_get(std::string url);
+  boost::asio::awaitable<Response> async_post(
+      std::string url, std::string body,
+      std::string content_type = "application/octet-stream");
+  boost::asio::awaitable<Response> async_put(
+      std::string url, std::string body,
+      std::string content_type = "application/octet-stream");
+  boost::asio::awaitable<Response> async_del(std::string url);
   void async_request_callback(Request request, ResponseHandler handler);
+  std::future<Response> request_async(Request request);
+  Response request(Request request);
+  Response get(std::string url);
+  Response post(std::string url, std::string body,
+                std::string content_type = "application/octet-stream");
+  Response put(std::string url, std::string body,
+               std::string content_type = "application/octet-stream");
+  Response del(std::string url);
   Stats stats() const;
   boost::asio::awaitable<void> reset_connections();
   void shutdown();

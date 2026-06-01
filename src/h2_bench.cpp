@@ -12,15 +12,51 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <string_view>
 
 namespace asio = boost::asio;
 
 namespace {
+
+struct ProcessMemoryStats {
+  std::uint64_t rss_kb = 0;
+  std::uint64_t peak_rss_kb = 0;
+};
+
+ProcessMemoryStats read_process_memory_stats() {
+  ProcessMemoryStats stats;
+#if defined(__linux__)
+  FILE* file = std::fopen("/proc/self/status", "r");
+  if (!file) {
+    return stats;
+  }
+  char line[256];
+  while (std::fgets(line, sizeof(line), file)) {
+    std::string_view text(line);
+    auto colon = text.find(':');
+    if (colon == std::string_view::npos) {
+      continue;
+    }
+    auto key = text.substr(0, colon);
+    std::uint64_t value = 0;
+    std::istringstream input(std::string(text.substr(colon + 1)));
+    input >> value;
+    if (key == "VmRSS") {
+      stats.rss_kb = value;
+    } else if (key == "VmHWM") {
+      stats.peak_rss_kb = value;
+    }
+  }
+  std::fclose(file);
+#endif
+  return stats;
+}
 
 struct Args {
   std::string url = "https://127.0.0.1:8443/ping";
@@ -185,13 +221,21 @@ asio::awaitable<void> run(Args args, httpclient::H2Client& client) {
                      std::chrono::steady_clock::now() - start)
                      .count();
   auto stats = client.stats();
+  auto mem = read_process_memory_stats();
   std::cout << "requests=" << args.requests << "\n";
   std::cout << "ok=" << state->ok.load() << " fail=" << state->fail.load() << "\n";
   std::cout << "wall_ms=" << wall_ms << "\n";
+  std::cout << "rss_kb=" << mem.rss_kb << " peak_rss_kb=" << mem.peak_rss_kb
+            << "\n";
   std::cout << "h2_streams_submitted=" << stats.streams_submitted
             << " h2_streams_completed=" << stats.streams_completed
             << " h2_streams_timed_out=" << stats.streams_timed_out
+            << " h2_streams_cancelled=" << stats.streams_cancelled
             << " h2_stream_slot_waits=" << stats.stream_slot_waits
+            << " h2_stream_slot_wait_cancelled="
+            << stats.stream_slot_wait_cancelled
+            << " h2_connect_waits=" << stats.connect_waits
+            << " h2_connect_wait_cancelled=" << stats.connect_wait_cancelled
             << " h2_max_active_streams=" << stats.max_active_streams
             << " h2_max_pending_stream_waiters=" << stats.max_pending_stream_waiters
             << " h2_peer_max_streams=" << stats.peer_max_concurrent_streams

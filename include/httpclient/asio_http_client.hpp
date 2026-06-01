@@ -40,11 +40,14 @@ public:
     std::uint64_t h1_close_after_response = 0;
     std::uint64_t h1_reuse_failed = 0;
     std::uint64_t h1_reconnect_after_idle = 0;
+    std::uint64_t h1_cancelled = 0;
+    std::uint64_t h1_pool_wait_cancelled = 0;
+    std::uint64_t h1_close_on_cancel = 0;
   };
 
   struct Options {
     std::size_t shard_count = 0;
-    std::size_t max_connections_per_origin = 64;
+    std::size_t max_connections_per_origin = 128;
     std::size_t max_origins_per_shard = 4096;
     std::chrono::seconds origin_idle_ttl{300};
     bool enable_ssl_verify = true;

@@ -33,6 +33,40 @@ int main() {
   }
 
   {
+    auto req = RequestBuilder::get("https://example.test/search#frag")
+                   .query_param("q", "hello world")
+                   .query_param("sym", "a+b&c")
+                   .basic_auth("alice", "secret")
+                   .build();
+    assert(req.url ==
+           "https://example.test/search?q=hello+world&sym=a%2Bb%26c#frag");
+    assert(req.header("authorization").value() == "Basic YWxpY2U6c2VjcmV0");
+  }
+
+  {
+    auto req = RequestBuilder::get("https://example.test/api")
+                   .bearer_auth("token")
+                   .follow_redirects()
+                   .max_redirects(3)
+                   .retries(2, 10)
+                   .cookie_jar(false)
+                   .auto_decompress()
+                   .timeout(httpclient::Request::Timeout{.total_ms = 200,
+                                                         .connect_ms = 50,
+                                                         .read_ms = 100})
+                   .build();
+    assert(req.header("Authorization").value() == "Bearer token");
+    assert(req.follow_redirects.value());
+    assert(req.max_redirects == 3);
+    assert(req.max_retries == 2);
+    assert(req.retry_backoff_ms == 10);
+    assert(!req.use_cookie_jar);
+    assert(req.auto_decompress);
+    assert(req.timeout_ms == 200);
+    assert(req.timeout.connect_ms == 50);
+  }
+
+  {
     std::vector<FormField> fields{{"x", "10"}, {"y", "a/b"}};
     assert(httpclient::form_urlencode(fields) == "x=10&y=a%2Fb");
   }
@@ -75,5 +109,35 @@ int main() {
     assert(!req.verify_peer && !req.verify_host);
     assert(req.disable_proxy);
     assert(!req.store_response_body && !req.store_response_headers);
+  }
+
+  {
+    auto req = RequestBuilder::get("http://example.test/proxy")
+                   .proxy("http://127.0.0.1:8899")
+                   .build();
+    assert(req.proxy.has_value());
+    assert(req.proxy->url == "http://127.0.0.1:8899");
+    assert(req.proxy_override);
+    assert(!req.disable_proxy);
+    req = RequestBuilder::get("http://example.test/proxy")
+              .proxy("http://127.0.0.1:8899")
+              .no_proxy()
+              .build();
+    assert(req.disable_proxy);
+    assert(!req.proxy.has_value());
+    assert(!req.proxy_override);
+  }
+
+  {
+    bool saw_chunk = false;
+    auto req = RequestBuilder::get("https://example.test/stream")
+                   .stream_response([&](std::string_view) {
+                     saw_chunk = true;
+                   })
+                   .build();
+    assert(!req.store_response_body);
+    assert(req.on_body_chunk);
+    req.on_body_chunk("x");
+    assert(saw_chunk);
   }
 }

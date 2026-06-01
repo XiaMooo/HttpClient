@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <array>
 #include <sstream>
 #include <utility>
 
@@ -65,6 +66,38 @@ void append_urlencoded(std::string& out, std::string_view value) {
       out.push_back(hex[c & 0x0F]);
     }
   }
+}
+
+std::string base64_encode(std::string_view value) {
+  static constexpr char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((value.size() + 2) / 3) * 4);
+  std::size_t i = 0;
+  while (i + 3 <= value.size()) {
+    const auto a = static_cast<unsigned char>(value[i++]);
+    const auto b = static_cast<unsigned char>(value[i++]);
+    const auto c = static_cast<unsigned char>(value[i++]);
+    out.push_back(alphabet[a >> 2]);
+    out.push_back(alphabet[((a & 0x03) << 4) | (b >> 4)]);
+    out.push_back(alphabet[((b & 0x0F) << 2) | (c >> 6)]);
+    out.push_back(alphabet[c & 0x3F]);
+  }
+  if (i < value.size()) {
+    const auto a = static_cast<unsigned char>(value[i++]);
+    out.push_back(alphabet[a >> 2]);
+    if (i < value.size()) {
+      const auto b = static_cast<unsigned char>(value[i]);
+      out.push_back(alphabet[((a & 0x03) << 4) | (b >> 4)]);
+      out.push_back(alphabet[(b & 0x0F) << 2]);
+      out.push_back('=');
+    } else {
+      out.push_back(alphabet[(a & 0x03) << 4]);
+      out.push_back('=');
+      out.push_back('=');
+    }
+  }
+  return out;
 }
 
 }  // namespace
@@ -169,6 +202,29 @@ RequestBuilder& RequestBuilder::content_type(std::string value) {
   return *this;
 }
 
+RequestBuilder& RequestBuilder::query_param(std::string name, std::string value) {
+  std::vector<QueryParam> params{{std::move(name), std::move(value)}};
+  request_.url = append_query_params(std::move(request_.url), params);
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::query_params(const std::vector<QueryParam>& params) {
+  request_.url = append_query_params(std::move(request_.url), params);
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::basic_auth(std::string username,
+                                           std::string password) {
+  request_.set_header("Authorization",
+                      basic_auth_value(username, password));
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::bearer_auth(std::string token) {
+  request_.set_header("Authorization", "Bearer " + std::move(token));
+  return *this;
+}
+
 RequestBuilder& RequestBuilder::body(std::string body) {
   request_.body = std::move(body);
   return *this;
@@ -212,6 +268,15 @@ RequestBuilder& RequestBuilder::multipart(const std::vector<MultipartPart>& part
 
 RequestBuilder& RequestBuilder::timeout_ms(long timeout_ms) {
   request_.timeout_ms = timeout_ms;
+  request_.timeout.total_ms = timeout_ms;
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::timeout(Request::Timeout timeout) {
+  request_.timeout = timeout;
+  if (timeout.total_ms >= 0) {
+    request_.timeout_ms = timeout.total_ms;
+  }
   return *this;
 }
 
@@ -223,11 +288,60 @@ RequestBuilder& RequestBuilder::insecure(bool value) {
 
 RequestBuilder& RequestBuilder::no_proxy(bool value) {
   request_.disable_proxy = value;
+  if (value) {
+    request_.proxy.reset();
+    request_.proxy_override = false;
+  }
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::proxy(std::string proxy_url) {
+  request_.proxy = ProxyConfig{std::move(proxy_url)};
+  request_.disable_proxy = false;
+  request_.proxy_override = true;
   return *this;
 }
 
 RequestBuilder& RequestBuilder::protocol(ProtocolPolicy policy) {
   request_.protocol_policy = policy;
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::follow_redirects(bool value) {
+  request_.follow_redirects = value;
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::max_redirects(int value) {
+  request_.max_redirects = value;
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::retries(int max_retries, long backoff_ms) {
+  request_.max_retries = max_retries;
+  request_.retry_backoff_ms = backoff_ms;
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::cookie_jar(bool value) {
+  request_.use_cookie_jar = value;
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::auto_decompress(bool value) {
+  request_.auto_decompress = value;
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::on_body_chunk(BodyChunkHandler handler) {
+  request_.on_body_chunk = std::move(handler);
+  return *this;
+}
+
+RequestBuilder& RequestBuilder::stream_response(BodyChunkHandler handler,
+                                                bool store_body) {
+  request_.on_body_chunk = std::move(handler);
+  request_.store_response_body = store_body;
   return *this;
 }
 
@@ -250,6 +364,59 @@ const Request& RequestBuilder::request() const {
 }
 
 RequestBuilder::RequestBuilder(Request request) : request_(std::move(request)) {}
+
+std::optional<std::string_view> Response::header(std::string_view name) const {
+  for (const auto& line : headers) {
+    auto [header_name, value] = split_header_view(line);
+    if (header_name_equal(header_name, name)) {
+      return value;
+    }
+  }
+  return std::nullopt;
+}
+
+std::vector<std::string_view> Response::headers_named(std::string_view name) const {
+  std::vector<std::string_view> out;
+  for (const auto& line : headers) {
+    auto [header_name, value] = split_header_view(line);
+    if (header_name_equal(header_name, name)) {
+      out.push_back(value);
+    }
+  }
+  return out;
+}
+
+std::string_view Response::text() const {
+  return body;
+}
+
+std::string_view Response::bytes() const {
+  return body;
+}
+
+std::optional<std::string_view> Response::content_type() const {
+  return header("Content-Type");
+}
+
+bool Response::is_success() const {
+  return error.empty() && status >= 200 && status < 400;
+}
+
+bool Response::is_redirect() const {
+  return status == 301 || status == 302 || status == 303 || status == 307 ||
+         status == 308;
+}
+
+void Response::raise_for_status() const {
+  if (error.empty() && status >= 400) {
+    throw HttpStatusError(*this);
+  }
+}
+
+HttpStatusError::HttpStatusError(const Response& response)
+    : std::runtime_error("HTTP status error: " +
+                         std::to_string(response.status)),
+      response_(response) {}
 
 std::string form_urlencode(
     std::initializer_list<std::pair<std::string_view, std::string_view>> fields) {
@@ -310,6 +477,42 @@ std::string multipart_form_data_body(const std::vector<MultipartPart>& parts,
   out.append(boundary);
   out.append("--\r\n");
   return out;
+}
+
+std::string append_query_params(std::string url,
+                                const std::vector<QueryParam>& params) {
+  if (params.empty()) {
+    return url;
+  }
+  auto fragment = url.find('#');
+  std::string suffix;
+  if (fragment != std::string::npos) {
+    suffix = url.substr(fragment);
+    url.resize(fragment);
+  }
+  url.push_back(url.find('?') == std::string::npos ? '?' : '&');
+  bool first = true;
+  for (const auto& field : params) {
+    if (!first) {
+      url.push_back('&');
+    }
+    first = false;
+    append_urlencoded(url, field.name);
+    url.push_back('=');
+    append_urlencoded(url, field.value);
+  }
+  url.append(suffix);
+  return url;
+}
+
+std::string basic_auth_value(std::string_view username,
+                             std::string_view password) {
+  std::string raw;
+  raw.reserve(username.size() + password.size() + 1);
+  raw.append(username);
+  raw.push_back(':');
+  raw.append(password);
+  return "Basic " + base64_encode(raw);
 }
 
 std::string make_multipart_boundary() {
