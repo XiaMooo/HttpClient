@@ -352,6 +352,25 @@ std::vector<httpclient::MultipartPart> parts{
 auto req = httpclient::RequestBuilder::post(url).multipart(parts).build();
 ```
 
+响应体和响应头默认会存入 `Response`。热路径或压测不需要保留响应内容时，可以显式关闭存储；
+如果只需要流式消费 body，用 `stream_response()` 或 `on_body_chunk()`：
+
+```cpp
+auto discard = httpclient::RequestBuilder::get(url)
+    .store_response(false, false)
+    .build();
+
+auto streamed = httpclient::RequestBuilder::get(url)
+    .stream_response([](std::string_view chunk) {
+      consume(chunk);
+    }, false)
+    .store_response(false, false)
+    .build();
+```
+
+H1/H2 都遵守这两个开关：关闭 body/header 存储后，runtime 仍完整读取网络响应以便复用连接，
+但不会把 body 追加到 `Response::body`，也不会构造 header 字符串列表。
+
 ## 运行优化等级矩阵
 
 先启动本地 HTTPS server：
@@ -392,8 +411,45 @@ BODY_CASES='0 1024' \
 WARMUP_PER_URL=128 \
 CONCURRENT_WARMUP=1 \
 STRICT_DETECT=1 \
-H2_SESSIONS=2 \
+PROFILE=auto \
 scripts/run_mixed_protocol_bench.sh
+```
+
+输出包含 `wall_ms`、`p50_us`、`p95_us`、`p99_us`、进程 CPU、RSS/Go runtime 内存和连接复用统计。
+`PROFILE=auto` 是默认值：低并发保持轻量，高并发自动扩大 H1 active shard
+窗口和 H2 active session 数。可用 `PROFILE=throughput` 固定高吞吐资源，或用
+`PROFILE=balanced` 做保守资源对照。
+趋势表格可以直接运行：
+
+```bash
+REQUEST_CASES='1000 5000 10000' \
+CONCURRENCY_CASES='128 256 512' \
+scripts/run_resource_trend_bench.sh
+```
+
+从个位数到大规模请求的趋势测试可以用：
+
+```bash
+REQUEST_CASES='8 64 1000 10000 100000' \
+CONCURRENCY_CASES='8 64 512' \
+scripts/run_scale_bench.sh
+```
+
+百万级默认不跑，避免本地误触发长时间压测；需要时显式打开：
+
+```bash
+INCLUDE_1E6=1 \
+RUN_GO_GATHER=0 \
+scripts/run_scale_bench.sh
+```
+
+H1 pool 固定采用 FIFO-fair idle reservation：连接归还后优先交给已等待的请求，
+不允许新请求插队抢走 idle connection。这是 runtime 稳定尾延迟语义，不提供配置开关。
+
+完整外部验证脚本会构建 O2、运行 ctest、可选 ASAN、可选 mixed bench：
+
+```bash
+RUN_ASAN=1 RUN_MIXED_BENCH=1 scripts/verify_external_bench.sh
 ```
 
 ## 运行 HTTPS/TLS 复用测试

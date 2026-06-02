@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -22,6 +23,11 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/resource.h>
+#endif
 
 namespace asio = boost::asio;
 
@@ -31,6 +37,53 @@ struct ProcessMemoryStats {
   std::uint64_t rss_kb = 0;
   std::uint64_t peak_rss_kb = 0;
 };
+
+struct ProcessCpuStats {
+  std::uint64_t user_us = 0;
+  std::uint64_t system_us = 0;
+};
+
+struct LatencyStats {
+  std::uint64_t p50_us = 0;
+  std::uint64_t p95_us = 0;
+  std::uint64_t p99_us = 0;
+};
+
+ProcessCpuStats read_process_cpu_stats() {
+  ProcessCpuStats stats;
+#if defined(__linux__) || defined(__APPLE__)
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+    stats.user_us =
+        static_cast<std::uint64_t>(usage.ru_utime.tv_sec) * 1000000ULL +
+        static_cast<std::uint64_t>(usage.ru_utime.tv_usec);
+    stats.system_us =
+        static_cast<std::uint64_t>(usage.ru_stime.tv_sec) * 1000000ULL +
+        static_cast<std::uint64_t>(usage.ru_stime.tv_usec);
+  }
+#endif
+  return stats;
+}
+
+LatencyStats summarize_latencies(std::vector<std::uint64_t>& latencies_us) {
+  LatencyStats stats;
+  if (latencies_us.empty()) {
+    return stats;
+  }
+  std::sort(latencies_us.begin(), latencies_us.end());
+  auto percentile = [&](double p) {
+    auto index = static_cast<std::size_t>(
+        std::ceil(p * static_cast<double>(latencies_us.size())) - 1.0);
+    if (index >= latencies_us.size()) {
+      index = latencies_us.size() - 1;
+    }
+    return latencies_us[index];
+  };
+  stats.p50_us = percentile(0.50);
+  stats.p95_us = percentile(0.95);
+  stats.p99_us = percentile(0.99);
+  return stats;
+}
 
 ProcessMemoryStats read_process_memory_stats() {
   ProcessMemoryStats stats;
@@ -68,6 +121,7 @@ struct Args {
   int concurrency = 4;
   int body_bytes = 0;
   int h2_sessions = 2;
+  int h2_shards = 0;
   int h2_max_streams = 128;
   int origin_waiters = 32;
   int max_cached_origins = 4096;
@@ -94,6 +148,8 @@ struct Args {
   bool mixed_shuffle = false;
   bool awaitable_mode = false;
   bool gather_mode = false;
+  httpclient::HttpClient::RuntimeProfile runtime_profile =
+      httpclient::HttpClient::RuntimeProfile::Auto;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -113,6 +169,8 @@ Args parse_args(int argc, char** argv) {
       args.body_bytes = std::atoi(argv[++i]);
     } else if (next("--h2-sessions")) {
       args.h2_sessions = std::atoi(argv[++i]);
+    } else if (next("--h2-shards")) {
+      args.h2_shards = std::atoi(argv[++i]);
     } else if (next("--h2-max-streams")) {
       args.h2_max_streams = std::atoi(argv[++i]);
     } else if (next("--origin-waiters")) {
@@ -173,6 +231,12 @@ Args parse_args(int argc, char** argv) {
     } else if (s == "--gather") {
       args.gather_mode = true;
       args.awaitable_mode = true;
+    } else if (s == "--balanced") {
+      args.runtime_profile = httpclient::HttpClient::RuntimeProfile::Balanced;
+    } else if (s == "--throughput") {
+      args.runtime_profile = httpclient::HttpClient::RuntimeProfile::Throughput;
+    } else if (s == "--auto-profile") {
+      args.runtime_profile = httpclient::HttpClient::RuntimeProfile::Auto;
     }
   }
   return args;
@@ -275,6 +339,8 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   };
 
   auto state = std::make_shared<State>();
+  auto latencies_us = std::make_shared<std::vector<std::uint64_t>>();
+  latencies_us->resize(static_cast<std::size_t>(std::max(0, args.requests)));
   auto payload = std::make_shared<std::string>(
       static_cast<std::size_t>(std::max(0, args.body_bytes)), 'x');
   auto ex = co_await asio::this_coro::executor;
@@ -363,9 +429,19 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   }
 
   auto stats_before = client.stats();
+  auto cpu_before = read_process_cpu_stats();
   auto start = std::chrono::steady_clock::now();
 
-  auto handle_response = [&, state, done_timer, ex](httpclient::Response resp) {
+  auto handle_response = [&, state, done_timer, ex](int id,
+                                                    httpclient::Response resp,
+                                                    std::chrono::steady_clock::time_point started) {
+    if (id >= 0 && id < args.requests) {
+      (*latencies_us)[static_cast<std::size_t>(id)] =
+          static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - started)
+                  .count());
+    }
     if (resp.http_version == 1) {
       state->h1.fetch_add(1);
     } else if (resp.http_version == 3) {
@@ -392,7 +468,15 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     return req;
   };
 
-  auto handle_response_no_timer = [&, state](httpclient::Response resp) {
+  auto handle_response_no_timer = [&, state](int id, httpclient::Response resp,
+                                             std::chrono::steady_clock::time_point started) {
+    if (id >= 0 && id < args.requests) {
+      (*latencies_us)[static_cast<std::size_t>(id)] =
+          static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - started)
+                  .count());
+    }
     if (resp.http_version == 1) {
       state->h1.fetch_add(1);
     } else if (resp.http_version == 3) {
@@ -409,16 +493,48 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     state->completed.fetch_add(1);
   };
 
+  auto handle_response_no_latency = [state](httpclient::Response resp) {
+    if (resp.http_version == 1) {
+      state->h1.fetch_add(1);
+    } else if (resp.http_version == 3) {
+      state->h2.fetch_add(1);
+    }
+    if (resp.error.empty() && resp.status >= 200 && resp.status < 500) {
+      state->ok.fetch_add(1);
+    } else {
+      if (state->fail.load() < 3 && !resp.error.empty()) {
+        std::cerr << "error=" << resp.error << "\n";
+      }
+      state->fail.fetch_add(1);
+    }
+    state->completed.fetch_add(1);
+  };
+
+  struct GatherResult {
+    httpclient::Response response;
+    std::uint64_t latency_us = 0;
+  };
+
   std::shared_ptr<std::function<void()>> callback_issue_one;
   if (args.gather_mode) {
     co_await asyncx::for_each_limited(
         static_cast<std::size_t>(args.requests),
         static_cast<std::size_t>(args.concurrency),
-        [&](std::size_t id) {
-          return client.async_request(make_indexed_request(static_cast<int>(id)));
+        [&](std::size_t id) -> asio::awaitable<GatherResult> {
+          auto request_start = std::chrono::steady_clock::now();
+          auto resp =
+              co_await client.async_request(make_indexed_request(static_cast<int>(id)));
+          auto latency_us = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - request_start)
+                  .count());
+          co_return GatherResult{std::move(resp), latency_us};
         },
-        [&](std::size_t, httpclient::Response resp) {
-          handle_response_no_timer(std::move(resp));
+        [&](std::size_t id, GatherResult result) {
+          if (id < latencies_us->size()) {
+            (*latencies_us)[id] = result.latency_us;
+          }
+          handle_response_no_latency(std::move(result.response));
         });
   } else if (!args.awaitable_mode) {
     callback_issue_one = std::make_shared<std::function<void()>>();
@@ -429,10 +545,12 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
         return;
       }
       auto req = make_indexed_request(id);
+      auto request_start = std::chrono::steady_clock::now();
       client.async_request_callback(
           std::move(req),
-          [weak_issue_one, handle_response](httpclient::Response resp) mutable {
-            handle_response(std::move(resp));
+          [id, request_start, weak_issue_one,
+           handle_response](httpclient::Response resp) mutable {
+            handle_response(id, std::move(resp), request_start);
             if (auto issue_one = weak_issue_one.lock()) {
               (*issue_one)();
             }
@@ -451,7 +569,13 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
             (args.mixed && !args.url_alt.empty())
                 ? (mixed_uses_alt(id, args.mixed_shuffle) ? args.url_alt : args.url)
                 : args.url);
+        auto request_start = std::chrono::steady_clock::now();
         auto resp = co_await client.async_request(std::move(req));
+        (*latencies_us)[static_cast<std::size_t>(id)] =
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - request_start)
+                    .count());
         if (resp.http_version == 1) {
           state->h1.fetch_add(1);
         } else if (resp.http_version == 3) {
@@ -485,11 +609,20 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - start)
                      .count();
+  auto cpu_after = read_process_cpu_stats();
   auto mem = read_process_memory_stats();
+  auto latency = summarize_latencies(*latencies_us);
+  const auto cpu_user_ms = (cpu_after.user_us - cpu_before.user_us) / 1000;
+  const auto cpu_system_ms =
+      (cpu_after.system_us - cpu_before.system_us) / 1000;
   std::cout << "requests=" << args.requests << "\n";
   std::cout << "ok=" << state->ok.load() << " fail=" << state->fail.load()
             << " h1=" << state->h1.load() << " h2=" << state->h2.load() << "\n";
   std::cout << "wall_ms=" << wall_ms << "\n";
+  std::cout << "p50_us=" << latency.p50_us << " p95_us=" << latency.p95_us
+            << " p99_us=" << latency.p99_us
+            << " cpu_user_ms=" << cpu_user_ms
+            << " cpu_system_ms=" << cpu_system_ms << "\n";
   std::cout << "rss_kb=" << mem.rss_kb << " peak_rss_kb=" << mem.peak_rss_kb
             << "\n";
   auto stats = diff_stats(client.stats(), stats_before);
@@ -550,6 +683,7 @@ int main(int argc, char** argv) {
   asio::io_context io;
   auto args = parse_args(argc, argv);
   httpclient::HttpClient::Options options;
+  options.runtime_profile = args.runtime_profile;
   options.h1.enable_ssl_verify = !args.insecure;
   options.h1.shard_count = static_cast<std::size_t>(std::max(0, args.h1_shards));
   if (args.h1_max_connections_per_origin > 0) {
@@ -566,6 +700,8 @@ int main(int argc, char** argv) {
   options.h1.h1_actor_connections_per_origin =
       static_cast<std::size_t>(std::max(1, args.h1_actor_connections_per_origin));
   options.h2.verify_tls = !args.insecure;
+  options.h2.shard_count =
+      static_cast<std::size_t>(std::max(0, args.h2_shards));
   options.h2.sessions_per_origin =
       static_cast<std::size_t>(std::max(1, args.h2_sessions));
   options.h2.max_concurrent_streams =

@@ -460,10 +460,11 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     asio::io_context io;
     asio::executor_work_guard<asio::io_context::executor_type> work;
     std::jthread thread;
+    asio::steady_timer maintenance_timer;
     std::unordered_map<std::string, std::shared_ptr<OriginPool>> origins;
     std::list<std::string> origin_lru;
 
-    Shard() : io(1), work(asio::make_work_guard(io)) {}
+    Shard() : io(1), work(asio::make_work_guard(io)), maintenance_timer(io) {}
   };
 
   struct PlainConnection {
@@ -511,6 +512,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     asio::steady_timer timer;
     bool woken = false;
     bool cancelled = false;
+    bool reserved_idle = false;
   };
 
   using WaiterPtr = std::shared_ptr<Waiter>;
@@ -541,6 +543,11 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     std::size_t next_h1_tls_actor = 0;
     std::size_t active_plain = 0;
     std::size_t active_tls = 0;
+    // Returned idle connections are reserved for the waiter we wake. This keeps
+    // hot H1 pools FIFO-fair and prevents new arrivals from repeatedly stealing
+    // the just-returned connection before the waiter resumes on the shard.
+    std::size_t reserved_idle_plain = 0;
+    std::size_t reserved_idle_tls = 0;
     bool lru_linked = false;
   };
 
@@ -590,15 +597,29 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     return message == "Operation canceled" || message == "operation_aborted";
   }
 
-  static void wake_one(WaiterQueue& waiters) {
+  static bool wake_one(WaiterQueue& waiters) {
     while (!waiters.empty()) {
       auto waiter = std::move(waiters.front());
       waiters.pop_front();
       if (waiter && !waiter->cancelled) {
         wake_waiter(waiter);
-        return;
+        return true;
       }
     }
+    return false;
+  }
+
+  static bool wake_one_with_idle_reservation(WaiterQueue& waiters) {
+    while (!waiters.empty()) {
+      auto waiter = std::move(waiters.front());
+      waiters.pop_front();
+      if (waiter && !waiter->cancelled) {
+        waiter->reserved_idle = true;
+        wake_waiter(waiter);
+        return true;
+      }
+    }
+    return false;
   }
 
   static bool pool_idle(const std::shared_ptr<OriginPool>& pool) {
@@ -622,6 +643,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     pool.idle_tls.clear();
     pool.active_plain = 0;
     pool.active_tls = 0;
+    pool.reserved_idle_plain = 0;
+    pool.reserved_idle_tls = 0;
   }
 
   struct AcquiredConnection {
@@ -635,6 +658,33 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     PlainConnection* plain = nullptr;
     TlsConnection* tls = nullptr;
     WaiterPtr waiter;
+  };
+
+  struct InflightGuard {
+    Impl* self = nullptr;
+    bool active = false;
+
+    explicit InflightGuard(Impl* owner) : self(owner), active(owner != nullptr) {
+      if (!active) {
+        return;
+      }
+      auto value = self->global_inflight_.fetch_add(1, std::memory_order_relaxed) + 1;
+      self->maybe_expand_auto_shards(value);
+    }
+
+    InflightGuard(const InflightGuard&) = delete;
+    InflightGuard& operator=(const InflightGuard&) = delete;
+
+    InflightGuard(InflightGuard&& other) noexcept
+        : self(other.self), active(other.active) {
+      other.active = false;
+    }
+
+    ~InflightGuard() {
+      if (active && self) {
+        self->global_inflight_.fetch_sub(1, std::memory_order_relaxed);
+      }
+    }
   };
 
   void cancel_request_on_shard(const std::shared_ptr<RequestCancelState>& state) {
@@ -791,7 +841,9 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
   explicit Impl(Options options) : options_(options) {
     if (options_.shard_count == 0) {
       auto n = std::thread::hardware_concurrency();
-      options_.shard_count = std::max<std::size_t>(1, std::min<std::size_t>(4, n));
+      auto cap = options_.auto_shards ? std::min<std::size_t>(16, n)
+                                      : std::min<std::size_t>(4, n);
+      options_.shard_count = std::max<std::size_t>(1, cap);
     }
     shards_.reserve(options_.shard_count);
     for (std::size_t i = 0; i < options_.shard_count; ++i) {
@@ -805,6 +857,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
 
   ~Impl() {
     for (auto& shard : shards_) {
+      shard->maintenance_timer.cancel();
       shard->work.reset();
       shard->io.stop();
     }
@@ -833,6 +886,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
                   closed_plain > pool->active_plain ? 0 : pool->active_plain - closed_plain;
               pool->active_tls =
                   closed_tls > pool->active_tls ? 0 : pool->active_tls - closed_tls;
+              pool->reserved_idle_plain = 0;
+              pool->reserved_idle_tls = 0;
               wake_one(pool->wait_plain);
               wake_one(pool->wait_tls);
               for (auto& actor : pool->h1_tls_actors) {
@@ -848,6 +903,15 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     }
   }
 
+  void start_maintenance() {
+    if (options_.maintenance_interval.count() <= 0) {
+      return;
+    }
+    for (auto& shard : shards_) {
+      schedule_maintenance(*shard);
+    }
+  }
+
   Shard& pick_shard(const ParsedUrl& url) {
     auto key = url.scheme + "://" + url.host + ":" + url.port;
     auto idx = std::hash<std::string>{}(key) % shards_.size();
@@ -860,8 +924,88 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     }
     auto key = url.scheme + "://" + url.host + ":" + url.port;
     auto base = std::hash<std::string>{}(key);
+    std::size_t shard_limit = shards_.size();
+    if (options_.auto_shards) {
+      shard_limit = active_auto_shards_.load(std::memory_order_relaxed);
+      shard_limit = std::max<std::size_t>(1, std::min(shard_limit, shards_.size()));
+    }
     auto seq = next_request_shard_.fetch_add(1, std::memory_order_relaxed);
-    return *shards_[(base + seq) % shards_.size()];
+    return *shards_[(base + seq) % shard_limit];
+  }
+
+  void maybe_expand_auto_shards(std::size_t inflight) {
+    if (!options_.auto_shards || shards_.size() <= 1) {
+      return;
+    }
+    auto current = active_auto_shards_.load(std::memory_order_relaxed);
+    auto target = current;
+    if (inflight >= 384) {
+      target = std::min<std::size_t>(16, shards_.size());
+    } else if (inflight >= 192) {
+      target = std::min<std::size_t>(8, shards_.size());
+    } else if (inflight >= 96) {
+      target = std::min<std::size_t>(4, shards_.size());
+    } else if (inflight >= 32) {
+      target = std::min<std::size_t>(2, shards_.size());
+    }
+    if (target <= current) {
+      return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> lock(auto_scale_mu_);
+      if (now - last_auto_scale_up_ < options_.auto_scale_up_interval) {
+        return;
+      }
+      last_auto_scale_up_ = now;
+    }
+    auto wanted = std::min<std::size_t>(target, current * 2);
+    while (wanted > current &&
+           !active_auto_shards_.compare_exchange_weak(
+               current, wanted, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+      wanted = std::min<std::size_t>(target, current * 2);
+    }
+  }
+
+  void schedule_maintenance(Shard& shard) {
+    shard.maintenance_timer.expires_after(options_.maintenance_interval);
+    std::weak_ptr<Impl> weak_self = shared_from_this();
+    shard.maintenance_timer.async_wait(
+        [&shard, weak_self](boost::system::error_code ec) {
+          if (ec) {
+            return;
+          }
+          auto self = weak_self.lock();
+          if (!self) {
+            return;
+          }
+          self->run_maintenance(shard);
+          self->schedule_maintenance(shard);
+        });
+  }
+
+  void run_maintenance(Shard& shard) {
+    evict_idle_origins(shard, true);
+    if (!options_.auto_shards || &shard != shards_.front().get()) {
+      return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    auto inflight = global_inflight_.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(auto_scale_mu_);
+    if (inflight > 8) {
+      last_auto_busy_ = now;
+      return;
+    }
+    if (now - last_auto_busy_ < options_.auto_scale_down_idle_ttl) {
+      return;
+    }
+    auto current = active_auto_shards_.load(std::memory_order_relaxed);
+    if (current > 1) {
+      active_auto_shards_.store(std::max<std::size_t>(1, current / 2),
+                                std::memory_order_relaxed);
+      last_auto_busy_ = now;
+    }
   }
 
   std::shared_ptr<OriginPool> get_origin_pool(Shard& shard, const ParsedUrl& url) {
@@ -893,7 +1037,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     shard.origin_lru.splice(shard.origin_lru.begin(), shard.origin_lru, pool.lru_it);
   }
 
-  void evict_idle_origins(Shard& shard) {
+  void evict_idle_origins(Shard& shard, bool periodic = false) {
     const auto max_origins = options_.max_origins_per_shard;
     if (max_origins == 0) {
       return;
@@ -922,7 +1066,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
         shard.origins.erase(map_it);
         continue;
       }
-      if (shard.origins.size() <= max_origins) {
+      if (!periodic && shard.origins.size() <= max_origins) {
         break;
       }
       ++it;
@@ -937,9 +1081,17 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     const auto pool_deadline = std::chrono::steady_clock::now() + pool_timeout;
     const auto max_connections =
         std::max<std::size_t>(1, options_.max_connections_per_origin);
+    bool woke_from_wait = false;
+    bool has_idle_reservation = false;
     for (;;) {
       AcquiredConnection conn;
-      if (!pool->idle_plain.empty()) {
+      if (!pool->idle_plain.empty() &&
+          (has_idle_reservation ||
+           (pool->reserved_idle_plain == 0 &&
+            (woke_from_wait || pool->wait_plain.empty())))) {
+        if (has_idle_reservation && pool->reserved_idle_plain > 0) {
+          --pool->reserved_idle_plain;
+        }
         conn.plain = std::move(pool->idle_plain.back());
         pool->idle_plain.pop_back();
         conn.reused = true;
@@ -947,7 +1099,15 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
         ++stats_.h1_conn_reused;
         co_return conn;
       }
-      if (pool->active_plain < max_connections) {
+      if (has_idle_reservation && pool->idle_plain.empty()) {
+        if (pool->reserved_idle_plain > 0) {
+          --pool->reserved_idle_plain;
+        }
+        has_idle_reservation = false;
+      }
+      if (pool->active_plain < max_connections &&
+          (woke_from_wait ||
+           (pool->reserved_idle_plain == 0 && pool->wait_plain.empty()))) {
         ++pool->active_plain;
         ++stats_.h1_idle_miss;
         try {
@@ -993,9 +1153,11 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       }
       if (ec != asio::error::operation_aborted &&
           pool_timeout.count() > 0 &&
-          std::chrono::steady_clock::now() >= pool_deadline) {
+            std::chrono::steady_clock::now() >= pool_deadline) {
         throw std::runtime_error("h1 pool timeout");
       }
+      woke_from_wait = waiter->woken;
+      has_idle_reservation = waiter->reserved_idle;
     }
   }
 
@@ -1085,9 +1247,17 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     const auto pool_deadline = std::chrono::steady_clock::now() + pool_timeout;
     const auto max_connections =
         std::max<std::size_t>(1, options_.max_connections_per_origin);
+    bool woke_from_wait = false;
+    bool has_idle_reservation = false;
     for (;;) {
       AcquiredConnection conn;
-      if (!pool->idle_tls.empty()) {
+      if (!pool->idle_tls.empty() &&
+          (has_idle_reservation ||
+           (pool->reserved_idle_tls == 0 &&
+            (woke_from_wait || pool->wait_tls.empty())))) {
+        if (has_idle_reservation && pool->reserved_idle_tls > 0) {
+          --pool->reserved_idle_tls;
+        }
         conn.tls = std::move(pool->idle_tls.back());
         pool->idle_tls.pop_back();
         conn.reused = true;
@@ -1095,7 +1265,15 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
         ++stats_.h1_conn_reused;
         co_return conn;
       }
-      if (pool->active_tls >= max_connections) {
+      if (has_idle_reservation && pool->idle_tls.empty()) {
+        if (pool->reserved_idle_tls > 0) {
+          --pool->reserved_idle_tls;
+        }
+        has_idle_reservation = false;
+      }
+      if (pool->active_tls >= max_connections ||
+          (!woke_from_wait &&
+           (pool->reserved_idle_tls > 0 || !pool->wait_tls.empty()))) {
         auto waiter =
             std::make_shared<Waiter>(co_await asio::this_coro::executor);
         if (cancel_state) {
@@ -1121,6 +1299,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
             std::chrono::steady_clock::now() >= pool_deadline) {
           throw std::runtime_error("h1 pool timeout");
         }
+        woke_from_wait = waiter->woken;
+        has_idle_reservation = waiter->reserved_idle;
         continue;
       }
       ++pool->active_tls;
@@ -1175,7 +1355,9 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     const auto max_connections =
         std::max<std::size_t>(1, options_.max_connections_per_origin);
     const auto pool_deadline = std::chrono::steady_clock::now() + pool_timeout;
-    while (pool->active_tls >= max_connections && pool->idle_tls.empty()) {
+    bool has_idle_reservation = false;
+    while ((pool->active_tls >= max_connections && pool->idle_tls.empty()) ||
+           (!has_idle_reservation && pool->reserved_idle_tls > 0)) {
       auto waiter =
           std::make_shared<Waiter>(co_await asio::this_coro::executor);
       waiter->timer.expires_at(pool_timeout.count() > 0
@@ -1195,8 +1377,12 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
           std::chrono::steady_clock::now() >= pool_deadline) {
         throw std::runtime_error("h1 pool timeout");
       }
+      has_idle_reservation = waiter->reserved_idle;
     }
     if (!pool->idle_tls.empty()) {
+      if (has_idle_reservation && pool->reserved_idle_tls > 0) {
+        --pool->reserved_idle_tls;
+      }
       auto conn = std::move(pool->idle_tls.back());
       pool->idle_tls.pop_back();
       set_h2_h1_alpn(conn->stream.native_handle());
@@ -1414,7 +1600,9 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       if (response.error.empty()) {
         pool->idle_tls.push_back(std::move(conn.tls));
         ++stats_.h1_return_to_idle;
-        wake_one(pool->wait_tls);
+        if (wake_one_with_idle_reservation(pool->wait_tls)) {
+          ++pool->reserved_idle_tls;
+        }
       } else {
         ++stats_.h1_close_after_response;
         if (pool->active_tls > 0) {
@@ -1472,7 +1660,9 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     if (response.error.empty()) {
       pool->idle_plain.push_back(std::move(conn.plain));
       ++stats_.h1_return_to_idle;
-      wake_one(pool->wait_plain);
+      if (wake_one_with_idle_reservation(pool->wait_plain)) {
+        ++pool->reserved_idle_plain;
+      }
     } else {
       ++stats_.h1_close_after_response;
       if (pool->active_plain > 0) {
@@ -1542,7 +1732,9 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
             }
             if (result.response.error.empty()) {
               pool->idle_tls.push_back(std::move(conn));
-              wake_one(pool->wait_tls);
+              if (wake_one_with_idle_reservation(pool->wait_tls)) {
+                ++pool->reserved_idle_tls;
+              }
             } else {
               if (pool->active_tls > 0) {
                 --pool->active_tls;
@@ -1595,6 +1787,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
 
   asio::awaitable<Response> request(Request request) {
     auto start = std::chrono::steady_clock::now();
+    InflightGuard inflight(this);
     try {
       co_await asio::this_coro::reset_cancellation_state(
           asio::enable_total_cancellation());
@@ -1642,6 +1835,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
 
   void submit(Request request, AsioHttpClient::ResponseHandler handler) {
     auto start = std::chrono::steady_clock::now();
+    auto inflight = std::make_shared<InflightGuard>(this);
     ParsedUrl url;
     try {
       url = parse_url(request.url);
@@ -1662,7 +1856,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     asio::co_spawn(
         shard.io,
         [self, shard = &shard, url = std::move(url), request = std::move(request), start,
-         handler = std::move(handler)]() mutable -> asio::awaitable<void> {
+         handler = std::move(handler), inflight = std::move(inflight)]() mutable
+            -> asio::awaitable<void> {
           auto pool = self->get_origin_pool(*shard, url);
           Response response;
           try {
@@ -1684,6 +1879,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
                       .count();
             }
           }
+          (void)inflight;
           handler(std::move(response));
         },
         asio::detached);
@@ -1692,13 +1888,21 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
   Options options_;
   std::vector<std::unique_ptr<Shard>> shards_;
   std::atomic<std::size_t> next_request_shard_{0};
+  std::atomic<std::size_t> active_auto_shards_{1};
+  std::atomic<std::size_t> global_inflight_{0};
+  std::mutex auto_scale_mu_;
+  std::chrono::steady_clock::time_point last_auto_scale_up_{};
+  std::chrono::steady_clock::time_point last_auto_busy_{
+      std::chrono::steady_clock::now()};
   Counters stats_;
 };
 
 AsioHttpClient::AsioHttpClient() : AsioHttpClient(Options{}) {}
 
 AsioHttpClient::AsioHttpClient(Options options)
-    : impl_(std::make_shared<Impl>(options)) {}
+    : impl_(std::make_shared<Impl>(options)) {
+  impl_->start_maintenance();
+}
 
 AsioHttpClient::~AsioHttpClient() = default;
 

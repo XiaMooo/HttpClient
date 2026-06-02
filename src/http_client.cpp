@@ -734,20 +734,61 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
     std::unordered_map<std::string, std::vector<Cookie>> cookies;
   };
 
+  static Options normalize_options(Options options) {
+    auto hw = std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    switch (options.runtime_profile) {
+      case HttpClient::RuntimeProfile::Auto:
+        options.h1.auto_shards = true;
+        options.h1.stripe_origins_across_shards = true;
+        if (options.h1.shard_count == 0) {
+          options.h1.shard_count = std::min<std::size_t>(16, hw);
+        }
+        options.h1.max_connections_per_origin =
+            std::min<std::size_t>(options.h1.max_connections_per_origin, 64);
+        options.h2.auto_shards = true;
+        if (options.h2.shard_count == 0) {
+          options.h2.shard_count = std::min<std::size_t>(4, hw);
+        }
+        options.h2.sessions_per_origin =
+            std::max<std::size_t>(options.h2.sessions_per_origin, 4);
+        break;
+      case HttpClient::RuntimeProfile::Throughput:
+        options.h1.auto_shards = false;
+        options.h1.stripe_origins_across_shards = true;
+        if (options.h1.shard_count == 0) {
+          options.h1.shard_count = std::min<std::size_t>(16, hw);
+        }
+        options.h1.max_connections_per_origin =
+            std::max<std::size_t>(options.h1.max_connections_per_origin, 512);
+        options.h2.auto_shards = false;
+        if (options.h2.shard_count == 0) {
+          options.h2.shard_count = std::min<std::size_t>(4, hw);
+        }
+        options.h2.sessions_per_origin =
+            std::max<std::size_t>(options.h2.sessions_per_origin, 4);
+        break;
+      case HttpClient::RuntimeProfile::Balanced:
+        options.h1.auto_shards = false;
+        options.h2.auto_shards = false;
+        break;
+    }
+    return options;
+  }
+
   Impl(Options options)
       : owned_io_(std::make_unique<asio::io_context>()),
         owned_work_(std::make_unique<OwnedWork>(
             asio::make_work_guard(*owned_io_))),
         owned_thread_([this] { owned_io_->run(); }),
         io_(*owned_io_),
-        options_(std::move(options)),
+        options_(normalize_options(std::move(options))),
         h1_(options_.h1),
         h2_(io_, options_.h2),
         cookie_jar_(options_) {}
 
   Impl(asio::io_context& io, Options options)
       : io_(io),
-        options_(std::move(options)),
+        options_(normalize_options(std::move(options))),
         h1_(options_.h1),
         h2_(io, options_.h2),
         cookie_jar_(options_) {}

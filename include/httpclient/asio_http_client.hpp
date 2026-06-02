@@ -47,9 +47,13 @@ public:
 
   struct Options {
     std::size_t shard_count = 0;
+    bool auto_shards = false;
     std::size_t max_connections_per_origin = 128;
     std::size_t max_origins_per_shard = 4096;
     std::chrono::seconds origin_idle_ttl{300};
+    std::chrono::seconds maintenance_interval{10};
+    std::chrono::seconds auto_scale_down_idle_ttl{60};
+    std::chrono::milliseconds auto_scale_up_interval{25};
     bool enable_ssl_verify = true;
     bool stripe_origins_across_shards = false;
     bool use_h1_connection_actor = false;

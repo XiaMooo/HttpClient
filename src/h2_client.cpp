@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -250,6 +251,25 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     bool response_started = false;
     std::chrono::steady_clock::time_point start{};
     H2Client::ResponseHandler handler;
+
+    void reset_for_reuse() {
+      response = Response{};
+      done = false;
+      store_body = true;
+      store_headers = true;
+      on_body_chunk = BodyChunkHandler{};
+      callback_mode = false;
+      body_source = BodySource{};
+      has_body_source = false;
+      deadline = {};
+      write_deadline = {};
+      read_deadline = {};
+      write_timeout = std::chrono::milliseconds{0};
+      read_timeout = std::chrono::milliseconds{0};
+      response_started = false;
+      start = {};
+      handler = H2Client::ResponseHandler{};
+    }
   };
 
   enum class DeadlineKind : unsigned char {
@@ -335,8 +355,9 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     waiter->timer.cancel();
   }
 
-  asio::awaitable<void> ensure_connected(const ParsedUrl& url, bool insecure) {
-    auto proxy = proxy_support::proxy_for_request(current_request_);
+  asio::awaitable<void> ensure_connected(const ParsedUrl& url, bool insecure,
+                                         const Request& request) {
+    auto proxy = proxy_support::proxy_for_request(request);
     if (connected_) {
       co_return;
     }
@@ -382,9 +403,12 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       }
       if (!session_) {
         nghttp2_session_client_new(&session_, callbacks_, this);
-        streams_.reserve(std::max<std::size_t>(256, options_.max_concurrent_streams * 2));
-        stream_index_.reserve(std::max<std::size_t>(256, options_.max_concurrent_streams * 2));
-        state_waiters_.reserve(std::max<std::size_t>(256, options_.max_concurrent_streams * 2));
+        const auto stream_capacity =
+            std::max<std::size_t>(256, options_.max_concurrent_streams * 2);
+        streams_.reserve(stream_capacity);
+        free_stream_indices_.reserve(stream_capacity);
+        stream_index_.reserve(stream_capacity);
+        state_waiters_.reserve(stream_capacity);
       }
 
       if (options_.verify_tls && !insecure) {
@@ -519,9 +543,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
           auto start = std::chrono::steady_clock::now();
           try {
             auto url = parse_url(request.url);
-            self->current_request_ = request;
-            co_await self->ensure_connected(url, insecure);
-            self->current_request_ = Request{};
+            co_await self->ensure_connected(url, insecure, request);
             auto slot = co_await self->acquire_stream_slot(
                 effective_timeout(request, &Request::Timeout::pool_ms));
             auto stream_id = self->submit_stream(std::move(request), url, start);
@@ -533,7 +555,6 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
             stream->handler = std::move(handler);
             slot.dismiss();
           } catch (const std::exception& e) {
-            self->current_request_ = Request{};
             Response response;
             response.error = e.what();
             response.total_time_sec =
@@ -546,13 +567,27 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
         asio::detached);
   }
 
+  void preconnect(Request request, bool insecure) {
+    auto self = shared_from_this();
+    asio::co_spawn(
+        strand_,
+        [self, request = std::move(request), insecure]() mutable
+            -> asio::awaitable<void> {
+          try {
+            auto url = parse_url(request.url);
+            co_await self->ensure_connected(url, insecure, request);
+          } catch (...) {
+          }
+          co_return;
+        },
+        asio::detached);
+  }
+
   asio::awaitable<Response> request_on_strand(Request request, bool insecure) {
     auto start = std::chrono::steady_clock::now();
     try {
       auto url = parse_url(request.url);
-      current_request_ = request;
-      co_await ensure_connected(url, insecure);
-      current_request_ = Request{};
+      co_await ensure_connected(url, insecure, request);
       auto slot = co_await acquire_stream_slot(
           effective_timeout(request, &Request::Timeout::pool_ms));
       auto stream_id = submit_stream(std::move(request), url, start);
@@ -590,7 +625,6 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       ++stats_.streams_completed;
       co_return response;
     } catch (const std::exception& e) {
-      current_request_ = Request{};
       Response response;
       response.error = e.what();
       response.total_time_sec =
@@ -625,20 +659,32 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       extra_headers.emplace_back(std::move(name), std::move(value));
     }
 
-    std::vector<nghttp2_nv> hdrs;
-    hdrs.reserve(6 + extra_headers.size());
-    hdrs.push_back(nv(":method", method));
-    hdrs.push_back(nv(":scheme", url.scheme));
-    hdrs.push_back(nv(":path", url.target));
-    hdrs.push_back(nv(":authority", url.host));
+    const auto max_header_count = 6 + extra_headers.size();
+    std::array<nghttp2_nv, 16> stack_headers{};
+    std::vector<nghttp2_nv> heap_headers;
+    if (max_header_count > stack_headers.size()) {
+      heap_headers.reserve(max_header_count);
+    }
+    std::size_t header_count = 0;
+    auto push_header = [&](nghttp2_nv header) {
+      if (max_header_count <= stack_headers.size()) {
+        stack_headers[header_count++] = header;
+      } else {
+        heap_headers.push_back(header);
+      }
+    };
+    push_header(nv(":method", method));
+    push_header(nv(":scheme", url.scheme));
+    push_header(nv(":path", url.target));
+    push_header(nv(":authority", url.host));
     if (!has_accept) {
-      hdrs.push_back(nv("accept", "*/*"));
+      push_header(nv("accept", "*/*"));
     }
     if (!request.body.empty()) {
-      hdrs.push_back(nv("content-length", content_length));
+      push_header(nv("content-length", content_length));
     }
     for (const auto& [name, value] : extra_headers) {
-      hdrs.push_back(nghttp2_nv{
+      push_header(nghttp2_nv{
           reinterpret_cast<uint8_t*>(const_cast<char*>(name.data())),
           reinterpret_cast<uint8_t*>(const_cast<char*>(value.data())),
           name.size(),
@@ -646,6 +692,11 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
           NGHTTP2_NV_FLAG_NONE,
       });
     }
+    auto* headers = max_header_count <= stack_headers.size() ? stack_headers.data()
+                                                             : heap_headers.data();
+    auto header_size = max_header_count <= stack_headers.size()
+                           ? header_count
+                           : heap_headers.size();
 
     const bool has_body = !request.body.empty();
     int32_t expected_stream_id = nghttp2_session_get_next_stream_id(session_);
@@ -664,7 +715,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     }
 
     int32_t stream_id =
-        nghttp2_submit_request(session_, nullptr, hdrs.data(), hdrs.size(), provider,
+        nghttp2_submit_request(session_, nullptr, headers, header_size, provider,
                                nullptr);
     if (stream_id < 0) {
       release_stream_entry(expected_stream_id);
@@ -1131,6 +1182,15 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     asio::dispatch(strand_, [self] { self->shutdown_now(); });
   }
 
+  void request_reset_if_idle() {
+    auto self = shared_from_this();
+    asio::dispatch(strand_, [self] {
+      if (self->idle()) {
+        self->reset_now();
+      }
+    });
+  }
+
   asio::awaitable<void> reset() {
     co_await asio::co_spawn(
         strand_,
@@ -1333,13 +1393,15 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   }
 
   StreamEntry& acquire_stream_entry(int32_t stream_id) {
-    for (auto& entry : streams_) {
-      if (!entry.in_use) {
+    while (!free_stream_indices_.empty()) {
+      auto index = free_stream_indices_.back();
+      free_stream_indices_.pop_back();
+      if (index < streams_.size() && !streams_[index].in_use) {
+        auto& entry = streams_[index];
         entry.id = stream_id;
         entry.in_use = true;
-        entry.state = StreamState{};
-        stream_index_[stream_id] =
-            static_cast<std::size_t>(&entry - streams_.data());
+        entry.state.reset_for_reuse();
+        stream_index_[stream_id] = index;
         return entry;
       }
     }
@@ -1352,9 +1414,10 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     auto* entry = find_stream_entry(stream_id);
     if (entry != nullptr) {
       stream_index_.erase(stream_id);
-      entry->state = StreamState{};
+      entry->state.reset_for_reuse();
       entry->id = 0;
       entry->in_use = false;
+      free_stream_indices_.push_back(static_cast<std::size_t>(entry - streams_.data()));
     }
   }
 
@@ -1377,11 +1440,11 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   std::unique_ptr<NestedStream> nested_stream_;
   std::vector<std::unique_ptr<Stream>> retired_streams_;
   std::vector<std::unique_ptr<NestedStream>> retired_nested_streams_;
-  Request current_request_;
   std::string connect_error_;
   nghttp2_session_callbacks* callbacks_ = nullptr;
   nghttp2_session* session_ = nullptr;
   std::vector<StreamEntry> streams_;
+  std::vector<std::size_t> free_stream_indices_;
   std::unordered_map<int32_t, std::size_t> stream_index_;
   std::unordered_map<int32_t, WaiterPtr> state_waiters_;
   std::vector<DeadlineEntry> deadline_heap_;
@@ -1407,18 +1470,176 @@ void H2Client::Impl::StreamSlot::release() {
 
 H2Client::H2Client(asio::io_context& io) : H2Client(io, Options{}) {}
 
+struct H2Client::IoShard {
+  asio::io_context io;
+  asio::executor_work_guard<asio::io_context::executor_type> work;
+  std::jthread thread;
+
+  IoShard() : io(1), work(asio::make_work_guard(io)) {}
+};
+
 struct H2Client::SessionGroup {
   std::vector<std::shared_ptr<Impl>> impls;
   std::atomic<std::size_t> next{0};
+  std::atomic<std::size_t> inflight{0};
+  std::atomic<std::size_t> active_impls{1};
   std::chrono::steady_clock::time_point last_used{};
+  std::chrono::steady_clock::time_point last_scale_up{};
+  std::chrono::steady_clock::time_point last_busy{
+      std::chrono::steady_clock::now()};
   std::list<std::string>::iterator lru_it;
   bool lru_linked = false;
 };
 
-H2Client::H2Client(asio::io_context& io, Options options)
-    : io_(io), options_(options) {}
+struct H2Client::ActiveImplDecision {
+  std::size_t previous = 1;
+  std::size_t active = 1;
+};
 
-H2Client::~H2Client() = default;
+H2Client::H2Client(asio::io_context& io, Options options)
+    : io_(io), options_(options) {
+  auto shard_count = options_.shard_count;
+  if (shard_count == 0) {
+    return;
+  }
+  shards_.reserve(shard_count);
+  for (std::size_t i = 0; i < shard_count; ++i) {
+    auto shard = std::make_unique<IoShard>();
+    auto* shard_ptr = shard.get();
+    shard->thread = std::jthread([shard_ptr] { shard_ptr->io.run(); });
+    shards_.push_back(std::move(shard));
+  }
+  schedule_maintenance();
+}
+
+H2Client::~H2Client() {
+  lifetime_token_.reset();
+  if (maintenance_timer_) {
+    maintenance_timer_->cancel();
+  }
+  stop_owned_shards();
+}
+
+boost::asio::io_context& H2Client::io_for_session(std::size_t index) {
+  if (shards_.empty()) {
+    return io_;
+  }
+  return shards_[index % shards_.size()]->io;
+}
+
+H2Client::ActiveImplDecision H2Client::active_impl_count(
+    SessionGroup& group, std::size_t inflight) const {
+  if (!options_.auto_shards) {
+    return ActiveImplDecision{group.impls.size(), group.impls.size()};
+  }
+  auto current = group.active_impls.load(std::memory_order_relaxed);
+  auto previous = current;
+  auto target = current;
+  if (inflight >= 384) {
+    target = std::min<std::size_t>(group.impls.size(), 4);
+  } else if (inflight >= 192) {
+    target = std::min<std::size_t>(group.impls.size(), 3);
+  } else if (inflight >= 64) {
+    target = std::min<std::size_t>(group.impls.size(), 2);
+  }
+  if (target <= current) {
+    auto active = std::max<std::size_t>(1, current);
+    return ActiveImplDecision{active, active};
+  }
+  auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(groups_mu_);
+  current = group.active_impls.load(std::memory_order_relaxed);
+  previous = current;
+  if (target > current &&
+      now - group.last_scale_up >= options_.auto_scale_up_interval) {
+    group.active_impls.store(std::min<std::size_t>(target, current + 1),
+                             std::memory_order_relaxed);
+    group.last_scale_up = now;
+    group.last_busy = now;
+  }
+  auto active = std::max<std::size_t>(
+      1, group.active_impls.load(std::memory_order_relaxed));
+  return ActiveImplDecision{std::max<std::size_t>(1, previous), active};
+}
+
+void H2Client::prewarm_active_impls(const std::shared_ptr<SessionGroup>& group,
+                                    const Request& request, bool insecure,
+                                    std::size_t previous_active,
+                                    std::size_t active) const {
+  if (!options_.auto_shards || !options_.auto_prewarm_sessions || !group ||
+      active <= previous_active) {
+    return;
+  }
+  auto end = std::min<std::size_t>(active, group->impls.size());
+  for (std::size_t i = previous_active; i < end; ++i) {
+    if (group->impls[i] && group->impls[i]->idle()) {
+      group->impls[i]->preconnect(request, insecure);
+    }
+  }
+}
+
+void H2Client::schedule_maintenance() {
+  if (options_.maintenance_interval.count() <= 0 || shards_.empty()) {
+    return;
+  }
+  if (!maintenance_timer_) {
+    maintenance_timer_ =
+        std::make_unique<asio::steady_timer>(shards_.front()->io);
+  }
+  maintenance_timer_->expires_after(options_.maintenance_interval);
+  std::weak_ptr<int> weak_token = lifetime_token_;
+  maintenance_timer_->async_wait([this, weak_token](boost::system::error_code ec) {
+    if (weak_token.expired()) {
+      return;
+    }
+    if (ec) {
+      return;
+    }
+    run_maintenance();
+    schedule_maintenance();
+  });
+}
+
+void H2Client::run_maintenance() {
+  std::lock_guard<std::mutex> lock(groups_mu_);
+  auto now = std::chrono::steady_clock::now();
+  for (auto& [_, group] : groups_) {
+    if (!group || !options_.auto_shards) {
+      continue;
+    }
+    auto inflight = group->inflight.load(std::memory_order_relaxed);
+    if (inflight > 8) {
+      group->last_busy = now;
+      continue;
+    }
+    if (now - group->last_busy < options_.auto_scale_down_idle_ttl) {
+      continue;
+    }
+    auto current = group->active_impls.load(std::memory_order_relaxed);
+    if (current <= 1) {
+      continue;
+    }
+    auto wanted = current - 1;
+    group->active_impls.store(wanted, std::memory_order_relaxed);
+    group->last_busy = now;
+    for (std::size_t i = wanted; i < group->impls.size(); ++i) {
+      if (group->impls[i] && group->impls[i]->idle()) {
+        group->impls[i]->request_reset_if_idle();
+      }
+    }
+  }
+  evict_session_groups_locked();
+}
+
+void H2Client::stop_owned_shards() {
+  for (auto& shard : shards_) {
+    if (!shard) {
+      continue;
+    }
+    shard->work.reset();
+    shard->io.stop();
+  }
+}
 
 bool H2Client::session_group_idle(const SessionGroup& group) const {
   return std::all_of(group.impls.begin(), group.impls.end(),
@@ -1523,8 +1744,10 @@ std::shared_ptr<H2Client::SessionGroup> H2Client::group_for(const Request& reque
   auto n = std::max<std::size_t>(1, options_.sessions_per_origin);
   group->impls.reserve(n);
   for (std::size_t i = 0; i < n; ++i) {
-    group->impls.push_back(std::make_shared<Impl>(io_, options_));
+    group->impls.push_back(std::make_shared<Impl>(io_for_session(i), options_));
   }
+  group->active_impls.store(options_.auto_shards ? 1 : group->impls.size(),
+                            std::memory_order_relaxed);
   group->last_used = std::chrono::steady_clock::now();
   group_lru_.push_front(key);
   group->lru_it = group_lru_.begin();
@@ -1546,18 +1769,37 @@ asio::awaitable<Response> H2Client::get(std::string url, bool insecure) {
 
 asio::awaitable<Response> H2Client::async_request(Request request, bool insecure) {
   auto group = group_for(request);
-  auto idx = group->next.fetch_add(1, std::memory_order_relaxed) %
-             group->impls.size();
-  co_return co_await group->impls[idx]->async_request(std::move(request), insecure);
+  auto inflight = group->inflight.fetch_add(1, std::memory_order_relaxed) + 1;
+  auto decision = active_impl_count(*group, inflight);
+  prewarm_active_impls(group, request, insecure, decision.previous,
+                       decision.active);
+  auto idx = group->next.fetch_add(1, std::memory_order_relaxed) % decision.active;
+  try {
+    auto response =
+        co_await group->impls[idx]->async_request(std::move(request), insecure);
+    group->inflight.fetch_sub(1, std::memory_order_relaxed);
+    co_return response;
+  } catch (...) {
+    group->inflight.fetch_sub(1, std::memory_order_relaxed);
+    throw;
+  }
 }
 
 void H2Client::async_request_callback(Request request, ResponseHandler handler,
                                       bool insecure) {
   auto group = group_for(request);
-  auto idx = group->next.fetch_add(1, std::memory_order_relaxed) %
-             group->impls.size();
-  group->impls[idx]->async_request_callback(std::move(request), std::move(handler),
-                                            insecure);
+  auto inflight = group->inflight.fetch_add(1, std::memory_order_relaxed) + 1;
+  auto decision = active_impl_count(*group, inflight);
+  prewarm_active_impls(group, request, insecure, decision.previous,
+                       decision.active);
+  auto idx = group->next.fetch_add(1, std::memory_order_relaxed) % decision.active;
+  group->impls[idx]->async_request_callback(
+      std::move(request),
+      [group = std::move(group), handler = std::move(handler)](Response response) mutable {
+        group->inflight.fetch_sub(1, std::memory_order_relaxed);
+        handler(std::move(response));
+      },
+      insecure);
 }
 
 H2Client::Stats H2Client::stats() const {

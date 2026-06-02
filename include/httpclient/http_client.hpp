@@ -24,7 +24,14 @@ public:
     WaitForDetection,
   };
 
+  enum class RuntimeProfile {
+    Auto,
+    Balanced,
+    Throughput,
+  };
+
   struct Options {
+    RuntimeProfile runtime_profile = RuntimeProfile::Auto;
     AsioHttpClient::Options h1;
     H2Client::Options h2;
     std::chrono::seconds h2_failure_ttl{30};
