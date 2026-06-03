@@ -1091,19 +1091,20 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       return;
     }
     auto now = std::chrono::steady_clock::now();
-    {
+    const bool urgent = inflight >= 384;
+    if (!urgent) {
       std::lock_guard<std::mutex> lock(auto_scale_mu_);
       if (now - last_auto_scale_up_ < options_.auto_scale_up_interval) {
         return;
       }
       last_auto_scale_up_ = now;
     }
-    auto wanted = std::min<std::size_t>(target, current * 2);
+    auto wanted = urgent ? target : std::min<std::size_t>(target, current * 2);
     while (wanted > current &&
            !active_auto_shards_.compare_exchange_weak(
                current, wanted, std::memory_order_relaxed,
                std::memory_order_relaxed)) {
-      wanted = std::min<std::size_t>(target, current * 2);
+      wanted = urgent ? target : std::min<std::size_t>(target, current * 2);
     }
   }
 

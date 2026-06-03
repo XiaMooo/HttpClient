@@ -15,6 +15,7 @@ RUN_ASYNCX="${RUN_ASYNCX:-1}"
 ROUNDS="${ROUNDS:-1}"
 CSV_FILE="${CSV_FILE:-}"
 PRINT_AGGREGATE="${PRINT_AGGREGATE:-1}"
+PROFILE="${PROFILE:-auto}"
 
 URL="https://127.0.0.1:${PORT}/ping"
 
@@ -104,11 +105,28 @@ run_case() {
   local max_conn="$1"
   local mode="$2"
   local gather_arg=()
+  local profile_arg=()
   if [[ "$mode" == "cpp-asyncx" ]]; then
     gather_arg+=(--gather)
   fi
+  case "$PROFILE" in
+    auto)
+      profile_arg+=(--auto-profile)
+      ;;
+    balanced)
+      profile_arg+=(--balanced)
+      ;;
+    throughput)
+      profile_arg+=(--throughput)
+      ;;
+    *)
+      echo "unknown PROFILE=$PROFILE" >&2
+      exit 1
+      ;;
+  esac
   "$ROOT_DIR/build-$PRESET/httpclient_bench" \
     "${gather_arg[@]}" \
+    "${profile_arg[@]}" \
     --url "$URL" \
     --requests "$REQUESTS" \
     --concurrency "$CONCURRENCY" \
@@ -141,7 +159,7 @@ if [[ -n "$CSV_TARGET" ]]; then
   printf 'round,max_conn,mode,wall_ms,p50_us,p95_us,p99_us,cpu_user_ms,cpu_system_ms,rss_kb,peak_rss_kb,h1_created,h1_idle_hit,h1_pool_wait_avg_us,h1_pool_wait_max_seen_us,h1_connect_avg_us,h1_connect_max_seen_us,h1_acquire_avg_us,h1_acquire_max_seen_us,h1_write_avg_us,h1_write_max_seen_us,h1_read_headers_avg_us,h1_read_headers_max_seen_us,h1_exchange_avg_us,h1_exchange_max_seen_us\n' >"$CSV_TARGET"
 fi
 
-echo "h1_pool_scan preset=$PRESET requests=$REQUESTS concurrency=$CONCURRENCY delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL rounds=$ROUNDS"
+echo "h1_pool_scan preset=$PRESET profile=$PROFILE requests=$REQUESTS concurrency=$CONCURRENCY delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL rounds=$ROUNDS"
 if [[ -n "$CSV_FILE" ]]; then
   echo "csv_file=$CSV_FILE"
 fi
