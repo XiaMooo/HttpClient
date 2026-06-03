@@ -10,6 +10,8 @@ DELAY_MS="${DELAY_MS:-5}"
 RESPONSE_BYTES="${RESPONSE_BYTES:-1024}"
 WARMUP_PER_URL="${WARMUP_PER_URL:-128}"
 PRECONNECT_PER_URL="${PRECONNECT_PER_URL:-0}"
+H1_ACTOR="${H1_ACTOR:-0}"
+H1_ACTOR_CONNECTIONS="${H1_ACTOR_CONNECTIONS:-32}"
 MAX_CONN_CASES="${MAX_CONN_CASES:-64 128 256 512}"
 PORT="${PORT:-8945}"
 RUN_ASYNCX="${RUN_ASYNCX:-1}"
@@ -107,8 +109,12 @@ run_case() {
   local mode="$2"
   local gather_arg=()
   local profile_arg=()
+  local h1_actor_arg=()
   if [[ "$mode" == "cpp-asyncx" ]]; then
     gather_arg+=(--gather)
+  fi
+  if [[ "$H1_ACTOR" == "1" ]]; then
+    h1_actor_arg+=(--h1-actor --h1-actor-connections "$H1_ACTOR_CONNECTIONS")
   fi
   case "$PROFILE" in
     auto)
@@ -136,6 +142,7 @@ run_case() {
     --concurrent-warmup \
     --strict-detect \
     --insecure --no-proxy \
+    "${h1_actor_arg[@]}" \
     --h1-max-connections-per-origin "$max_conn"
 }
 
@@ -161,7 +168,7 @@ if [[ -n "$CSV_TARGET" ]]; then
   printf 'round,max_conn,mode,wall_ms,p50_us,p95_us,p99_us,cpu_user_ms,cpu_system_ms,rss_kb,peak_rss_kb,h1_created,h1_idle_hit,h1_pool_wait_avg_us,h1_pool_wait_max_seen_us,h1_connect_avg_us,h1_connect_max_seen_us,h1_acquire_avg_us,h1_acquire_max_seen_us,h1_write_avg_us,h1_write_max_seen_us,h1_read_headers_avg_us,h1_read_headers_max_seen_us,h1_exchange_avg_us,h1_exchange_max_seen_us\n' >"$CSV_TARGET"
 fi
 
-echo "h1_pool_scan preset=$PRESET profile=$PROFILE requests=$REQUESTS concurrency=$CONCURRENCY delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL preconnect_per_url=$PRECONNECT_PER_URL rounds=$ROUNDS"
+echo "h1_pool_scan preset=$PRESET profile=$PROFILE requests=$REQUESTS concurrency=$CONCURRENCY delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL preconnect_per_url=$PRECONNECT_PER_URL h1_actor=$H1_ACTOR h1_actor_connections=$H1_ACTOR_CONNECTIONS rounds=$ROUNDS"
 if [[ -n "$CSV_FILE" ]]; then
   echo "csv_file=$CSV_FILE"
 fi

@@ -23,6 +23,7 @@
 #include <openssl/ssl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstring>
@@ -853,9 +854,10 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       std::shared_ptr<asio::steady_timer> notify;
     };
 
-    H1TlsActor(asio::any_io_executor executor, std::shared_ptr<OriginPool> pool,
-               ParsedUrl url)
+    H1TlsActor(Impl* owner, asio::any_io_executor executor,
+               std::shared_ptr<OriginPool> pool, ParsedUrl url)
         : strand(asio::make_strand(executor)),
+          owner(owner),
           pool(std::move(pool)),
           url(std::move(url)) {}
 
@@ -867,6 +869,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       item->start = start;
       item->notify = std::make_shared<asio::steady_timer>(ex);
       item->notify->expires_at(asio::steady_timer::time_point::max());
+      pending_count.fetch_add(1, std::memory_order_relaxed);
 
       auto self = shared_from_this();
       co_await asio::co_spawn(
@@ -895,6 +898,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
 
         auto item = std::move(queue.front());
         queue.pop_front();
+        pending_count.fetch_sub(1, std::memory_order_relaxed);
 
         try {
           auto connect_timeout =
@@ -904,10 +908,21 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
           auto read_timeout =
               effective_timeout(item->request, &Request::Timeout::read_ms);
           co_await ensure_connected(item->request, connect_timeout);
-          item->response =
-              co_await run_http_exchange(conn->stream, conn->buffer, url,
-                                         std::move(item->request), item->start,
-                                         write_timeout, read_timeout);
+          auto timings = owner ? owner->h1_exchange_timings() : H1ExchangeTimings{};
+          if (owner && owner->options_.use_lightweight_h1) {
+            item->response =
+                co_await run_light_h1_exchange(conn->stream, conn->read_buffer,
+                                               conn->write_buffer, url,
+                                               std::move(item->request), item->start,
+                                               write_timeout, read_timeout, false,
+                                               &timings);
+          } else {
+            item->response =
+                co_await run_http_exchange(conn->stream, conn->buffer, url,
+                                           std::move(item->request), item->start,
+                                           write_timeout, read_timeout, false,
+                                           &timings);
+          }
         } catch (const std::exception& e) {
           item->response.error = e.what();
           if (item->request.measure_total_time) {
@@ -931,6 +946,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
         co_return;
       }
 
+      auto connect_started = std::chrono::steady_clock::now();
       conn = std::make_unique<TlsConnection>(strand, pool->ssl_ctx);
       if (request.verify_peer && request.verify_host) {
         conn->stream.set_verify_mode(asio::ssl::verify_peer);
@@ -956,6 +972,15 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
           .set_option(tcp::no_delay(true), option_ec);
       co_await conn->stream.async_handshake(asio::ssl::stream_base::client,
                                             asio::use_awaitable);
+      if (owner) {
+        ++owner->stats_.h1_conn_created;
+        owner->record_timing(owner->stats_.h1_connect,
+                             owner->elapsed_us(connect_started));
+      }
+    }
+
+    std::size_t pending() const {
+      return pending_count.load(std::memory_order_relaxed);
     }
 
     void close() {
@@ -970,10 +995,12 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     }
 
     asio::strand<asio::any_io_executor> strand;
+    Impl* owner = nullptr;
     std::shared_ptr<OriginPool> pool;
     ParsedUrl url;
     std::unique_ptr<TlsConnection> conn;
     std::deque<std::shared_ptr<Item>> queue;
+    std::atomic<std::size_t> pending_count{0};
     bool running = false;
   };
 
@@ -1078,9 +1105,9 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     }
     auto current = active_auto_shards_.load(std::memory_order_relaxed);
     auto target = current;
-    if (inflight >= 384) {
+    if (inflight >= 512) {
       target = std::min<std::size_t>(16, shards_.size());
-    } else if (inflight >= 192) {
+    } else if (inflight >= 128) {
       target = std::min<std::size_t>(8, shards_.size());
     } else if (inflight >= 96) {
       target = std::min<std::size_t>(4, shards_.size());
@@ -1091,7 +1118,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       return;
     }
     auto now = std::chrono::steady_clock::now();
-    const bool urgent = inflight >= 384;
+    const bool urgent = inflight >= 128;
     if (!urgent) {
       std::lock_guard<std::mutex> lock(auto_scale_mu_);
       if (now - last_auto_scale_up_ < options_.auto_scale_up_interval) {
@@ -1099,12 +1126,15 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       }
       last_auto_scale_up_ = now;
     }
-    auto wanted = urgent ? target : std::min<std::size_t>(target, current * 2);
+    // Shards and threads are already constructed. Scaling the active routing
+    // window directly avoids the first-burst pool wait that otherwise appears
+    // when a high-concurrency H1 workload ramps from one shard by powers of two.
+    auto wanted = target;
     while (wanted > current &&
            !active_auto_shards_.compare_exchange_weak(
                current, wanted, std::memory_order_relaxed,
                std::memory_order_relaxed)) {
-      wanted = urgent ? target : std::min<std::size_t>(target, current * 2);
+      wanted = target;
     }
   }
 
@@ -1956,16 +1986,26 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     auto cancel_state = co_await asio::this_coro::cancellation_state;
     auto actor = co_await asio::co_spawn(
         pool->strand,
-        [pool, url, actors_per_origin]() mutable
+        [owner = this, pool, url, actors_per_origin]() mutable
             -> asio::awaitable<std::shared_ptr<H1TlsActor>> {
           auto target = std::max<std::size_t>(
               1, std::min<std::size_t>(actors_per_origin, 256));
           while (pool->h1_tls_actors.size() < target) {
             pool->h1_tls_actors.push_back(
-                std::make_shared<H1TlsActor>(pool->executor, pool, url));
+                std::make_shared<H1TlsActor>(owner, pool->executor, pool, url));
           }
-          auto actor =
-              pool->h1_tls_actors[pool->next_h1_tls_actor++ % pool->h1_tls_actors.size()];
+          auto actor = pool->h1_tls_actors.front();
+          auto best_pending = actor ? actor->pending() : std::size_t{0};
+          for (auto& candidate : pool->h1_tls_actors) {
+            if (!candidate) {
+              continue;
+            }
+            auto pending = candidate->pending();
+            if (!actor || pending < best_pending) {
+              actor = candidate;
+              best_pending = pending;
+            }
+          }
           co_return actor;
         },
         asio::bind_cancellation_slot(cancel_state.slot(), asio::use_awaitable));
