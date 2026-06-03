@@ -1080,12 +1080,14 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
     }
 
     co_await gate->set_protocol(ProtocolState::H1Only);
+    auto route_url = request.url;
+    auto retry_request = request;
     auto probe = co_await h1_.async_probe(std::move(request));
     if (probe.protocol == AsioHttpClient::ProbeProtocol::Http11 &&
         probe.response.error.empty()) {
       ++stats_.probe_h1_adopted;
       remember_route(key, ProtocolState::H1Only);
-      store_tls_route(this, request.url, std::move(key),
+      store_tls_route(this, std::move(route_url), std::move(key),
                       CachedRouteProtocol::H1Only,
                       cache_generation_.load(std::memory_order_relaxed));
       co_return probe.response;
@@ -1094,14 +1096,14 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
       ++stats_.probe_h2_marked;
       co_await gate->record_h2_origin();
       remember_route(key, ProtocolState::H2Available);
-      store_tls_route(this, request.url, std::move(key),
+      store_tls_route(this, retry_request.url, std::move(key),
                       CachedRouteProtocol::H2Available,
                       cache_generation_.load(std::memory_order_relaxed));
       co_await gate->set_protocol(ProtocolState::H2Available);
-      co_return co_await request_h2(std::move(request), false);
+      co_return co_await request_h2(std::move(retry_request), false);
     }
     ++stats_.probe_reconnect;
-    co_return co_await h1_.async_request(std::move(request));
+    co_return co_await h1_.async_request(std::move(retry_request));
   }
 
   asio::awaitable<Response> request_prefer_h2(Request request) {
@@ -1116,6 +1118,7 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
       co_return response;
     }
     co_await gate->mark_h2_failed();
+    auto retry_request = request;
     auto probe = co_await h1_.async_probe(std::move(request));
     if (probe.protocol == AsioHttpClient::ProbeProtocol::Http11 &&
         probe.response.error.empty()) {
@@ -1128,10 +1131,10 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
       co_await gate->record_h2_origin();
       remember_route(key, ProtocolState::H2Available);
       co_await gate->set_protocol(ProtocolState::H2Available);
-      co_return co_await request_h2(std::move(request), false);
+      co_return co_await request_h2(std::move(retry_request), false);
     }
     ++stats_.probe_reconnect;
-    co_return co_await h1_.async_request(std::move(request));
+    co_return co_await h1_.async_request(std::move(retry_request));
   }
 
   asio::awaitable<Response> request_prefer_h1(Request request) {

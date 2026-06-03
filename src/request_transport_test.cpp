@@ -339,6 +339,28 @@ asio::awaitable<void> run(Args args) {
   assert(h2_after_cancel_response.error.empty());
   assert(h2_after_cancel_response.status == 200);
 
+  httpclient::HttpClient route_cache_client(io, options);
+  auto auto_h1_first = httpclient::RequestBuilder::get(args.h1_url)
+                           .insecure()
+                           .no_proxy()
+                           .build();
+  auto auto_h1_first_response =
+      co_await route_cache_client.async_request(std::move(auto_h1_first));
+  assert(auto_h1_first_response.error.empty());
+  assert(auto_h1_first_response.status == 200);
+  auto route_after_first = route_cache_client.stats();
+  auto auto_h1_second = httpclient::RequestBuilder::get(args.h1_url)
+                            .insecure()
+                            .no_proxy()
+                            .build();
+  auto auto_h1_second_response =
+      co_await route_cache_client.async_request(std::move(auto_h1_second));
+  assert(auto_h1_second_response.error.empty());
+  assert(auto_h1_second_response.status == 200);
+  auto route_after_second = route_cache_client.stats();
+  assert(route_after_second.url_route_cache_hits >
+         route_after_first.url_route_cache_hits);
+
   httpclient::HttpClient::Options h1_wait_options = options;
   h1_wait_options.h1.max_connections_per_origin = 1;
   httpclient::HttpClient h1_wait_client(io, h1_wait_options);
@@ -424,6 +446,7 @@ asio::awaitable<void> run(Args args) {
 
   client.shutdown();
   cookie_client.shutdown();
+  route_cache_client.shutdown();
   h1_wait_client.shutdown();
   h2_wait_client.shutdown();
 }
