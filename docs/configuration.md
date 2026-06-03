@@ -44,6 +44,9 @@ H1 pool 的连接归还固定采用 FIFO-fair idle reservation：如果已有请
 显示：Auto 有效上限 32 在 100k/1M mixed 场景下比 64 更低 RSS、更少 TLS connection，
 且吞吐和 p99 没有退化。256/512 这类大连接数只适合作为 Throughput 压测选项。调参建议
 使用 `scripts/run_h1_pool_scan.sh` 同时观察 `h1_conn_created`：热路径里该值应接近 0。
+该脚本支持 `ROUNDS=N` 多轮扫描、`CSV_FILE=path` 保存原始数据，并会在多轮时输出
+median/p95 聚合表。100k/c512 本地 H1-only TLS 扫描里，32 的 wall median 和 p99
+通常优于 64/128，16 则会明显排队。
 
 ## H2 Session
 

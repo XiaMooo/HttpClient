@@ -12,17 +12,30 @@ WARMUP_PER_URL="${WARMUP_PER_URL:-128}"
 MAX_CONN_CASES="${MAX_CONN_CASES:-64 128 256 512}"
 PORT="${PORT:-8945}"
 RUN_ASYNCX="${RUN_ASYNCX:-1}"
+ROUNDS="${ROUNDS:-1}"
+CSV_FILE="${CSV_FILE:-}"
+PRINT_AGGREGATE="${PRINT_AGGREGATE:-1}"
 
 URL="https://127.0.0.1:${PORT}/ping"
 
 pids=()
+tmp_files=()
 cleanup() {
   for pid in "${pids[@]:-}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done
   wait >/dev/null 2>&1 || true
+  for file in "${tmp_files[@]:-}"; do
+    rm -f "$file"
+  done
 }
 trap cleanup EXIT
+
+CSV_TARGET="$CSV_FILE"
+if [[ -z "$CSV_TARGET" && "$ROUNDS" -gt 1 && "$PRINT_AGGREGATE" == "1" ]]; then
+  CSV_TARGET="$(mktemp)"
+  tmp_files+=("$CSV_TARGET")
+fi
 
 extract_field() {
   local key="$1"
@@ -36,7 +49,8 @@ extract_field() {
 print_row() {
   local max_conn="$1"
   local mode="$2"
-  local output="$3"
+  local round="$3"
+  local output="$4"
   local wall p50 p95 p99 cpu_user cpu_system rss peak created idle_hit
   wall="$(printf '%s\n' "$output" | extract_field wall_ms)"
   p50="$(printf '%s\n' "$output" | extract_field p50_us)"
@@ -48,10 +62,16 @@ print_row() {
   peak="$(printf '%s\n' "$output" | extract_field peak_rss_kb)"
   created="$(printf '%s\n' "$output" | extract_field h1_conn_created)"
   idle_hit="$(printf '%s\n' "$output" | extract_field h1_idle_hit)"
-  printf '| %s | %s | %s | %s/%s/%s | %s/%s | %s | %s | %s | %s |\n' \
-    "$max_conn" "$mode" "${wall:-error}" "${p50:--}" "${p95:--}" "${p99:--}" \
+  printf '| %s | %s | %s | %s | %s/%s/%s | %s/%s | %s | %s | %s | %s |\n' \
+    "$round" "$max_conn" "$mode" "${wall:-error}" "${p50:--}" "${p95:--}" "${p99:--}" \
     "${cpu_user:--}" "${cpu_system:--}" "${rss:--}" "${peak:--}" \
     "${created:--}" "${idle_hit:--}"
+  if [[ -n "$CSV_TARGET" ]]; then
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$round" "$max_conn" "$mode" "${wall:-}" "${p50:-}" "${p95:-}" \
+      "${p99:-}" "${cpu_user:-}" "${cpu_system:-}" "${rss:-}" "${peak:-}" \
+      "${created:-}" >>"$CSV_TARGET"
+  fi
 }
 
 run_case() {
@@ -90,16 +110,70 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 
-echo "h1_pool_scan preset=$PRESET requests=$REQUESTS concurrency=$CONCURRENCY delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL"
-echo
-echo "| max_conn | mode | wall_ms | p50/p95/p99_us | cpu_user/system_ms | rss_kb | peak_rss_kb | h1_created | h1_idle_hit |"
-echo "|---:|---|---:|---|---|---:|---:|---:|---:|"
+if [[ -n "$CSV_TARGET" ]]; then
+  mkdir -p "$(dirname "$CSV_TARGET")"
+  printf 'round,max_conn,mode,wall_ms,p50_us,p95_us,p99_us,cpu_user_ms,cpu_system_ms,rss_kb,peak_rss_kb,h1_created\n' >"$CSV_TARGET"
+fi
 
-for max_conn in $MAX_CONN_CASES; do
-  output="$(run_case "$max_conn" cpp-callback 2>&1)" || true
-  print_row "$max_conn" cpp-callback "$output"
-  if [[ "$RUN_ASYNCX" == "1" ]]; then
-    output="$(run_case "$max_conn" cpp-asyncx 2>&1)" || true
-    print_row "$max_conn" cpp-asyncx "$output"
-  fi
+echo "h1_pool_scan preset=$PRESET requests=$REQUESTS concurrency=$CONCURRENCY delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL rounds=$ROUNDS"
+if [[ -n "$CSV_FILE" ]]; then
+  echo "csv_file=$CSV_FILE"
+fi
+echo
+echo "| round | max_conn | mode | wall_ms | p50/p95/p99_us | cpu_user/system_ms | rss_kb | peak_rss_kb | h1_created | h1_idle_hit |"
+echo "|---:|---:|---|---:|---|---|---:|---:|---:|---:|"
+
+for round in $(seq 1 "$ROUNDS"); do
+  for max_conn in $MAX_CONN_CASES; do
+    output="$(run_case "$max_conn" cpp-callback 2>&1)" || true
+    print_row "$max_conn" cpp-callback "$round" "$output"
+    if [[ "$RUN_ASYNCX" == "1" ]]; then
+      output="$(run_case "$max_conn" cpp-asyncx 2>&1)" || true
+      print_row "$max_conn" cpp-asyncx "$round" "$output"
+    fi
+  done
 done
+
+if [[ "$ROUNDS" -gt 1 && "$PRINT_AGGREGATE" == "1" && -n "$CSV_TARGET" ]]; then
+  python3 - "$CSV_TARGET" <<'PY'
+import csv
+import math
+import statistics
+import sys
+from collections import defaultdict
+
+path = sys.argv[1]
+groups = defaultdict(list)
+with open(path, newline="") as fh:
+    for row in csv.DictReader(fh):
+        if row.get("wall_ms"):
+            groups[(int(row["max_conn"]), row["mode"])].append(row)
+
+def values(rows, key):
+    return [int(row[key]) for row in rows if row.get(key)]
+
+def median(rows, key):
+    vals = values(rows, key)
+    return "" if not vals else str(int(statistics.median(vals)))
+
+def percentile(rows, key, p):
+    vals = sorted(values(rows, key))
+    if not vals:
+        return ""
+    idx = max(0, min(len(vals) - 1, math.ceil(len(vals) * p) - 1))
+    return str(vals[idx])
+
+print()
+print("h1_pool_scan_aggregate")
+print()
+print("| max_conn | mode | samples | wall_median_ms | wall_p95_ms | p95_median_us | p99_median_us | rss_median_kb | h1_created_median |")
+print("|---:|---|---:|---:|---:|---:|---:|---:|---:|")
+for (max_conn, mode), rows in sorted(groups.items()):
+    print(
+        f"| {max_conn} | {mode} | {len(rows)} | "
+        f"{median(rows, 'wall_ms')} | {percentile(rows, 'wall_ms', 0.95)} | "
+        f"{median(rows, 'p95_us')} | {median(rows, 'p99_us')} | "
+        f"{median(rows, 'rss_kb')} | {median(rows, 'h1_created')} |"
+    )
+PY
+fi
