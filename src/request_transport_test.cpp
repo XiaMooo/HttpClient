@@ -361,6 +361,28 @@ asio::awaitable<void> run(Args args) {
   assert(route_after_second.url_route_cache_hits >
          route_after_first.url_route_cache_hits);
 
+  auto preconnect_req = httpclient::RequestBuilder::get(args.h1_url)
+                            .insecure()
+                            .no_proxy()
+                            .build();
+  co_await route_cache_client.preconnect(std::move(preconnect_req), 1);
+  auto preconnect_after = route_cache_client.stats();
+  assert(preconnect_after.h1_pool.h1_conn_created >=
+         route_after_second.h1_pool.h1_conn_created);
+  auto preconnect_hit = httpclient::RequestBuilder::get(args.h1_url)
+                            .insecure()
+                            .no_proxy()
+                            .build();
+  auto preconnect_hit_response =
+      co_await route_cache_client.async_request(std::move(preconnect_hit));
+  assert(preconnect_hit_response.error.empty());
+  assert(preconnect_hit_response.status == 200);
+  auto after_preconnect_hit = route_cache_client.stats();
+  assert(after_preconnect_hit.h1_pool.h1_conn_created ==
+         preconnect_after.h1_pool.h1_conn_created);
+  assert(after_preconnect_hit.h1_pool.h1_conn_reused >
+         preconnect_after.h1_pool.h1_conn_reused);
+
   httpclient::HttpClient::Options h1_wait_options = options;
   h1_wait_options.h1.max_connections_per_origin = 1;
   httpclient::HttpClient h1_wait_client(io, h1_wait_options);

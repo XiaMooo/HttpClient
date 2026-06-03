@@ -107,6 +107,7 @@ public:
   Response put(std::string url, std::string body,
                std::string content_type = "application/octet-stream");
   Response del(std::string url);
+  boost::asio::awaitable<void> preconnect(Request request, std::size_t count);
   Stats stats() const;
   boost::asio::awaitable<void> reset_connections();
   void shutdown();

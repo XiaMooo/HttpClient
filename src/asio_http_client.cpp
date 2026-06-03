@@ -1386,6 +1386,53 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     co_return new_conn;
   }
 
+  asio::awaitable<std::unique_ptr<PlainConnection>> open_plain_connection(
+      const ParsedUrl& url, std::chrono::milliseconds connect_timeout) {
+    auto conn =
+        std::make_unique<PlainConnection>(co_await asio::this_coro::executor);
+    tcp::resolver resolver(co_await asio::this_coro::executor);
+    conn->stream.expires_after(connect_timeout);
+    auto results = co_await resolver.async_resolve(url.host, url.port,
+                                                   asio::use_awaitable);
+    co_await conn->stream.async_connect(results, asio::use_awaitable);
+    boost::system::error_code option_ec;
+    conn->stream.socket().set_option(tcp::no_delay(true), option_ec);
+    co_return conn;
+  }
+
+  asio::awaitable<std::unique_ptr<TlsConnection>> open_tls_connection(
+      std::shared_ptr<OriginPool> pool, const ParsedUrl& url, const Request& request,
+      std::chrono::milliseconds connect_timeout) {
+    auto conn =
+        std::make_unique<TlsConnection>(co_await asio::this_coro::executor,
+                                        pool->ssl_ctx);
+    if (request.verify_peer && request.verify_host && options_.enable_ssl_verify) {
+      conn->stream.set_verify_mode(asio::ssl::verify_peer);
+    } else {
+      conn->stream.set_verify_mode(asio::ssl::verify_none);
+    }
+
+    if (!SSL_set_tlsext_host_name(conn->stream.native_handle(), url.host.c_str())) {
+      throw beast::system_error(
+          beast::error_code(static_cast<int>(::ERR_get_error()),
+                            asio::error::get_ssl_category()));
+    }
+
+    tcp::resolver resolver(co_await asio::this_coro::executor);
+    beast::get_lowest_layer(conn->stream).expires_after(connect_timeout);
+    auto results = co_await resolver.async_resolve(url.host, url.port,
+                                                   asio::use_awaitable);
+    co_await beast::get_lowest_layer(conn->stream)
+        .async_connect(results, asio::use_awaitable);
+    boost::system::error_code option_ec;
+    beast::get_lowest_layer(conn->stream)
+        .socket()
+        .set_option(tcp::no_delay(true), option_ec);
+    co_await conn->stream.async_handshake(asio::ssl::stream_base::client,
+                                          asio::use_awaitable);
+    co_return conn;
+  }
+
   asio::awaitable<AcquiredConnection> acquire_tls(
       std::shared_ptr<OriginPool> pool, const ParsedUrl& url, const Request& request,
       std::chrono::milliseconds connect_timeout,
@@ -1461,35 +1508,9 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
 
     try {
       auto connect_started = std::chrono::steady_clock::now();
-      auto new_conn =
-          std::make_unique<TlsConnection>(co_await asio::this_coro::executor,
-                                          pool->ssl_ctx);
+      auto new_conn = co_await open_tls_connection(pool, url, request,
+                                                   connect_timeout);
       ++stats_.h1_conn_created;
-      if (request.verify_peer && request.verify_host && options_.enable_ssl_verify) {
-        new_conn->stream.set_verify_mode(asio::ssl::verify_peer);
-      } else {
-        new_conn->stream.set_verify_mode(asio::ssl::verify_none);
-      }
-
-      if (!SSL_set_tlsext_host_name(new_conn->stream.native_handle(), url.host.c_str())) {
-        throw beast::system_error(
-            beast::error_code(static_cast<int>(::ERR_get_error()),
-                              asio::error::get_ssl_category()));
-      }
-
-      tcp::resolver resolver(co_await asio::this_coro::executor);
-      beast::get_lowest_layer(new_conn->stream).expires_after(connect_timeout);
-      tcp::resolver::results_type results;
-      results = co_await resolver.async_resolve(url.host, url.port,
-                                                asio::use_awaitable);
-      co_await beast::get_lowest_layer(new_conn->stream)
-          .async_connect(results, asio::use_awaitable);
-      boost::system::error_code option_ec;
-      beast::get_lowest_layer(new_conn->stream)
-          .socket()
-          .set_option(tcp::no_delay(true), option_ec);
-      co_await new_conn->stream.async_handshake(asio::ssl::stream_base::client,
-                                                asio::use_awaitable);
       record_timing(stats_.h1_connect, elapsed_us(connect_started));
       record_timing(stats_.h1_acquire, elapsed_us(acquire_started));
       co_return AcquiredConnection{{}, std::move(new_conn), false};
@@ -2000,6 +2021,95 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     }
   }
 
+  asio::awaitable<void> preconnect(Request request, std::size_t count) {
+    if (count == 0) {
+      co_return;
+    }
+    auto url = parse_url(request.url);
+    std::vector<Shard*> targets;
+    if (options_.stripe_origins_across_shards) {
+      auto shard_limit = shards_.size();
+      if (options_.auto_shards) {
+        shard_limit = active_auto_shards_.load(std::memory_order_relaxed);
+        shard_limit = std::max<std::size_t>(
+            1, std::min<std::size_t>(shard_limit, shards_.size()));
+      }
+      targets.reserve(shard_limit);
+      for (std::size_t i = 0; i < shard_limit; ++i) {
+        targets.push_back(shards_[i].get());
+      }
+    } else {
+      targets.push_back(&pick_shard(url));
+    }
+
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+      auto* shard = targets[i];
+      auto remaining = count > i ? count - i : 0;
+      auto target_count = (remaining + targets.size() - 1) / targets.size();
+      if (target_count == 0) {
+        continue;
+      }
+      co_await asio::co_spawn(
+          shard->io,
+          [self = shared_from_this(), shard, url, request, target_count]() mutable
+              -> asio::awaitable<void> {
+          auto pool = self->get_origin_pool(*shard, url);
+          const auto max_connections =
+              std::max<std::size_t>(1, self->options_.max_connections_per_origin);
+          auto connect_timeout =
+              effective_timeout(request, &Request::Timeout::connect_ms);
+          for (;;) {
+            const auto active = url.tls ? pool->active_tls : pool->active_plain;
+            const auto idle = url.tls ? pool->idle_tls.size() : pool->idle_plain.size();
+            if (idle >= target_count || active >= max_connections) {
+              break;
+            }
+
+            if (url.tls) {
+              ++pool->active_tls;
+            } else {
+              ++pool->active_plain;
+            }
+            try {
+              auto connect_started = std::chrono::steady_clock::now();
+              if (url.tls) {
+                auto conn =
+                    co_await self->open_tls_connection(pool, url, request,
+                                                       connect_timeout);
+                ++self->stats_.h1_conn_created;
+                self->record_timing(self->stats_.h1_connect,
+                                    self->elapsed_us(connect_started));
+                pool->idle_tls.push_back(std::move(conn));
+                ++self->stats_.h1_return_to_idle;
+              } else {
+                auto conn = co_await self->open_plain_connection(url, connect_timeout);
+                ++self->stats_.h1_conn_created;
+                self->record_timing(self->stats_.h1_connect,
+                                    self->elapsed_us(connect_started));
+                pool->idle_plain.push_back(std::move(conn));
+                ++self->stats_.h1_return_to_idle;
+              }
+            } catch (...) {
+              if (url.tls) {
+                if (pool->active_tls > 0) {
+                  --pool->active_tls;
+                }
+                self->wake_one(pool->wait_tls);
+              } else {
+                if (pool->active_plain > 0) {
+                  --pool->active_plain;
+                }
+                self->wake_one(pool->wait_plain);
+              }
+              throw;
+            }
+          }
+          co_return;
+          },
+          asio::use_awaitable);
+    }
+  }
+
   void submit(Request request, AsioHttpClient::ResponseHandler handler) {
     auto start = std::chrono::steady_clock::now();
     auto inflight = std::make_shared<InflightGuard>(this);
@@ -2085,6 +2195,11 @@ void AsioHttpClient::async_request_callback(Request request,
 asio::awaitable<AsioHttpClient::ProbeResult> AsioHttpClient::async_probe(
     Request request) {
   return impl_->probe_request(std::move(request));
+}
+
+asio::awaitable<void> AsioHttpClient::preconnect(Request request,
+                                                 std::size_t count) {
+  co_return co_await impl_->preconnect(std::move(request), count);
 }
 
 AsioHttpClient::Stats AsioHttpClient::stats() const {

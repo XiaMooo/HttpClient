@@ -1389,6 +1389,44 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
     co_await h2_.reset_connections();
   }
 
+  asio::awaitable<void> preconnect(Request request, std::size_t count) {
+    if (count == 0) {
+      co_return;
+    }
+    apply_defaults(request);
+    if (request.proxy.has_value() || options_.proxy.has_value() ||
+        options_.trust_env_proxy) {
+      co_return;
+    }
+
+    switch (request.protocol_policy) {
+      case ProtocolPolicy::ForceH1:
+      case ProtocolPolicy::PreferH1:
+        co_return co_await h1_.preconnect(std::move(request), count);
+      case ProtocolPolicy::ForceH2:
+      case ProtocolPolicy::PreferH2:
+        co_return;
+      case ProtocolPolicy::Auto:
+        break;
+    }
+
+    std::string key;
+    CachedRouteProtocol cached = CachedRouteProtocol::Unknown;
+    if (lookup_tls_route(this, request.url, options_.origin_cache_ttl,
+                         cache_generation_.load(std::memory_order_acquire), key,
+                         cached)) {
+      if (cached == CachedRouteProtocol::H1Only) {
+        co_return co_await h1_.preconnect(std::move(request), count);
+      }
+      co_return;
+    }
+
+    key = origin_key(request);
+    if (remembered_route(key) == ProtocolState::H1Only) {
+      co_return co_await h1_.preconnect(std::move(request), count);
+    }
+  }
+
   HttpClient::Stats stats() const {
     return HttpClient::Stats{
         stats_.probe_h1_adopted.load(),
@@ -1523,6 +1561,10 @@ HttpClient::Stats HttpClient::stats() const {
 
 asio::awaitable<void> HttpClient::reset_connections() {
   co_return co_await impl_->reset_connections();
+}
+
+asio::awaitable<void> HttpClient::preconnect(Request request, std::size_t count) {
+  co_return co_await impl_->preconnect(std::move(request), count);
 }
 
 }  // namespace httpclient

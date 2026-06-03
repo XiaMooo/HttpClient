@@ -25,6 +25,7 @@ H1_ORIGIN_IDLE_TTL_SEC="${H1_ORIGIN_IDLE_TTL_SEC:-300}"
 H1_ACTOR_CONNECTIONS="${H1_ACTOR_CONNECTIONS:-8}"
 BODY_CASES="${BODY_CASES:-0 1024}"
 WARMUP_PER_URL="${WARMUP_PER_URL:-512}"
+PRECONNECT_PER_URL="${PRECONNECT_PER_URL:-0}"
 CONCURRENT_WARMUP="${CONCURRENT_WARMUP:-1}"
 STRICT_DETECT="${STRICT_DETECT:-0}"
 RUN_CPP_CALLBACK="${RUN_CPP_CALLBACK:-1}"
@@ -80,7 +81,7 @@ wait_for_server "$H2_URL"
 wait_for_server "$H1_URL"
 
 echo "mixed_protocol_bench preset=$PRESET profile=$PROFILE requests=$REQUESTS concurrency=$CONCURRENCY delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES"
-echo "h2_url=$H2_URL h1_url=$H1_URL h2_sessions=$H2_SESSIONS h2_shards=$H2_SHARDS h2_max_streams=$H2_MAX_STREAMS origin_waiters=$ORIGIN_WAITERS warmup_per_url=$WARMUP_PER_URL concurrent_warmup=$CONCURRENT_WARMUP strict_detect=$STRICT_DETECT"
+echo "h2_url=$H2_URL h1_url=$H1_URL h2_sessions=$H2_SESSIONS h2_shards=$H2_SHARDS h2_max_streams=$H2_MAX_STREAMS origin_waiters=$ORIGIN_WAITERS warmup_per_url=$WARMUP_PER_URL preconnect_per_url=$PRECONNECT_PER_URL concurrent_warmup=$CONCURRENT_WARMUP strict_detect=$STRICT_DETECT"
 echo "origin_cache max=$MAX_CACHED_ORIGINS ttl_sec=$ORIGIN_CACHE_TTL_SEC h2_failure_ttl_sec=$H2_FAILURE_TTL_SEC h1_shards=$H1_SHARDS h1_max_conn=$H1_MAX_CONNECTIONS_PER_ORIGIN h1_max_origins_per_shard=$H1_MAX_ORIGINS_PER_SHARD h1_origin_idle_ttl_sec=$H1_ORIGIN_IDLE_TTL_SEC"
 echo
 
@@ -92,6 +93,10 @@ fi
 warmup_args=()
 if [[ "$CONCURRENT_WARMUP" == "1" ]]; then
   warmup_args+=(--concurrent-warmup)
+fi
+preconnect_args=()
+if [[ "$PRECONNECT_PER_URL" -gt 0 ]]; then
+  preconnect_args+=(--preconnect-per-url "$PRECONNECT_PER_URL")
 fi
 
 h1_extra_args=()
@@ -135,6 +140,7 @@ for body_bytes in $BODY_CASES; do
       "${profile_args[@]}" \
       --warmup-per-url "$WARMUP_PER_URL" \
       "${warmup_args[@]}" \
+      "${preconnect_args[@]}" \
       --insecure --no-proxy \
       "${strict_args[@]}" \
       --h2-sessions "$H2_SESSIONS" \
@@ -165,6 +171,7 @@ for body_bytes in $BODY_CASES; do
       "${profile_args[@]}" \
       --warmup-per-url "$WARMUP_PER_URL" \
       "${warmup_args[@]}" \
+      "${preconnect_args[@]}" \
       --insecure --no-proxy \
       "${strict_args[@]}" \
       --h2-sessions "$H2_SESSIONS" \

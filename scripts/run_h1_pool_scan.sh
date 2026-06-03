@@ -9,6 +9,7 @@ CONCURRENCY="${CONCURRENCY:-512}"
 DELAY_MS="${DELAY_MS:-5}"
 RESPONSE_BYTES="${RESPONSE_BYTES:-1024}"
 WARMUP_PER_URL="${WARMUP_PER_URL:-128}"
+PRECONNECT_PER_URL="${PRECONNECT_PER_URL:-0}"
 MAX_CONN_CASES="${MAX_CONN_CASES:-64 128 256 512}"
 PORT="${PORT:-8945}"
 RUN_ASYNCX="${RUN_ASYNCX:-1}"
@@ -131,6 +132,7 @@ run_case() {
     --requests "$REQUESTS" \
     --concurrency "$CONCURRENCY" \
     --warmup-per-url "$WARMUP_PER_URL" \
+    --preconnect-per-url "$PRECONNECT_PER_URL" \
     --concurrent-warmup \
     --strict-detect \
     --insecure --no-proxy \
@@ -159,7 +161,7 @@ if [[ -n "$CSV_TARGET" ]]; then
   printf 'round,max_conn,mode,wall_ms,p50_us,p95_us,p99_us,cpu_user_ms,cpu_system_ms,rss_kb,peak_rss_kb,h1_created,h1_idle_hit,h1_pool_wait_avg_us,h1_pool_wait_max_seen_us,h1_connect_avg_us,h1_connect_max_seen_us,h1_acquire_avg_us,h1_acquire_max_seen_us,h1_write_avg_us,h1_write_max_seen_us,h1_read_headers_avg_us,h1_read_headers_max_seen_us,h1_exchange_avg_us,h1_exchange_max_seen_us\n' >"$CSV_TARGET"
 fi
 
-echo "h1_pool_scan preset=$PRESET profile=$PROFILE requests=$REQUESTS concurrency=$CONCURRENCY delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL rounds=$ROUNDS"
+echo "h1_pool_scan preset=$PRESET profile=$PROFILE requests=$REQUESTS concurrency=$CONCURRENCY delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL preconnect_per_url=$PRECONNECT_PER_URL rounds=$ROUNDS"
 if [[ -n "$CSV_FILE" ]]; then
   echo "csv_file=$CSV_FILE"
 fi

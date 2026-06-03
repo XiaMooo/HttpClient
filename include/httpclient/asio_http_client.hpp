@@ -88,6 +88,7 @@ public:
   boost::asio::awaitable<Response> async_request(Request request);
   void async_request_callback(Request request, ResponseHandler handler);
   boost::asio::awaitable<ProbeResult> async_probe(Request request);
+  boost::asio::awaitable<void> preconnect(Request request, std::size_t count);
   Stats stats() const;
   boost::asio::awaitable<void> reset_connections();
 

@@ -172,6 +172,7 @@ struct Args {
   int h1_origin_idle_ttl_sec = 300;
   int h1_actor_connections_per_origin = 8;
   int warmup_per_url = 0;
+  int preconnect_per_url = 0;
   bool reset_connections_after_warmup = false;
   bool concurrent_warmup = false;
   bool sequential_warmup = false;
@@ -232,6 +233,8 @@ Args parse_args(int argc, char** argv) {
       args.h1_actor_connections_per_origin = std::atoi(argv[++i]);
     } else if (next("--warmup-per-url")) {
       args.warmup_per_url = std::atoi(argv[++i]);
+    } else if (next("--preconnect-per-url")) {
+      args.preconnect_per_url = std::atoi(argv[++i]);
     } else if (s == "--reset-connections-after-warmup") {
       args.reset_connections_after_warmup = true;
     } else if (s == "--concurrent-warmup") {
@@ -459,6 +462,15 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
 
   if (args.reset_connections_after_warmup) {
     co_await client.reset_connections();
+  }
+
+  if (args.preconnect_per_url > 0) {
+    for (const auto& url : urls) {
+      auto req = make_request(url);
+      co_await client.preconnect(std::move(req),
+                                 static_cast<std::size_t>(
+                                     std::max(0, args.preconnect_per_url)));
+    }
   }
 
   auto stats_before = client.stats();
