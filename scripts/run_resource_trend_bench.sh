@@ -29,6 +29,7 @@ RUN_GO_WORKER="${RUN_GO_WORKER:-1}"
 RUN_GO_GATHER="${RUN_GO_GATHER:-1}"
 H2_PORT="${H2_PORT:-8643}"
 H1_PORT="${H1_PORT:-8645}"
+CSV_FILE="${CSV_FILE:-}"
 
 if [[ "$INCLUDE_1E6" == "1" && "$REQUEST_CASES" != *1000000* ]]; then
   REQUEST_CASES="$REQUEST_CASES 1000000"
@@ -178,6 +179,14 @@ print_cpp_row() {
     "${cpu_user:--}" "${cpu_system:--}" \
     "${rss:--}" "${peak:--}" "-" "-" "-" "$h1" "$h2" \
     "${slot_waits:-0}" "${cancels:-0}"
+  if [[ -n "$CSV_FILE" ]]; then
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$axis" "$value" "$mode" "$body_bytes" "$requests" "$concurrency" \
+      "${wall:-}" "${p50:-}" "${p95:-}" "${p99:-}" \
+      "${cpu_user:-}" "${cpu_system:-}" \
+      "${rss:-}" "${peak:-}" "" "" "" "" "" "${h1:-}" "${h2:-}" \
+      "${slot_waits:-0}" "${cancels:-0}" >>"$CSV_FILE"
+  fi
   if [[ -z "$wall" ]]; then
     printf '<details><summary>%s %s=%s output</summary>\n\n```text\n%s\n```\n</details>\n\n' \
       "$mode" "$axis" "$value" "$output"
@@ -212,6 +221,14 @@ print_go_row() {
     "${cpu_user:--}" "${cpu_system:--}" \
     "${alloc:--}" "${sys:--}" "${heap:--}" "${stack:--}" \
     "${gc:--}" "$h1" "$h2"
+  if [[ -n "$CSV_FILE" ]]; then
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$axis" "$value" "$mode" "$body_bytes" "$requests" "$concurrency" \
+      "${wall:-}" "${p50:-}" "${p95:-}" "${p99:-}" \
+      "${cpu_user:-}" "${cpu_system:-}" \
+      "" "" "${alloc:-}" "${sys:-}" "${heap:-}" "${stack:-}" "${gc:-}" \
+      "${h1:-}" "${h2:-}" "" "" >>"$CSV_FILE"
+  fi
   if [[ -z "$wall" ]]; then
     printf '<details><summary>%s %s=%s output</summary>\n\n```text\n%s\n```\n</details>\n\n' \
       "$mode" "$axis" "$value" "$output"
@@ -271,8 +288,16 @@ pids+=("$!")
 wait_for_server "$H2_URL"
 wait_for_server "$H1_URL"
 
+if [[ -n "$CSV_FILE" ]]; then
+  mkdir -p "$(dirname "$CSV_FILE")"
+  printf 'axis,value,mode,body,requests,concurrency,wall_ms,p50_us,p95_us,p99_us,cpu_user_ms,cpu_system_ms,cpp_rss_kb,cpp_peak_rss_kb,go_alloc_kb,go_sys_kb,go_heap_alloc_kb,go_stack_inuse_kb,go_gc,h1,h2,h2_slot_waits,h1_cancels\n' >"$CSV_FILE"
+fi
+
 echo "resource_trend_bench preset=$PRESET profile=$PROFILE delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL"
 echo "h2_sessions=$H2_SESSIONS h2_shards=$H2_SHARDS h2_max_streams=$H2_MAX_STREAMS origin_waiters=$ORIGIN_WAITERS strict_detect=$STRICT_DETECT h1_shards=$H1_SHARDS h1_max_conn=$H1_MAX_CONNECTIONS_PER_ORIGIN stripe_h1_origin_shards=$STRIPE_H1_ORIGIN_SHARDS"
+if [[ -n "$CSV_FILE" ]]; then
+  echo "csv_file=$CSV_FILE"
+fi
 echo
 echo "| axis | value | mode | body | requests | concurrency | wall_ms | p50/p95/p99_us | cpu_user/system_ms | cpp_rss_kb | cpp_peak_rss_kb | go_alloc_kb | go_sys_kb | go_heap/stack/gc | h1 | h2 | h2_slot_waits | h1_cancels |"
 echo "|---|---:|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|"
