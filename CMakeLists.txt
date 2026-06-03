@@ -127,6 +127,7 @@ endif()
 
 httpclient_add_test_executable(request_builder_test src/request_builder_test.cpp httpclient_core)
 httpclient_add_test_executable(request_transport_test src/request_transport_test.cpp httpclient)
+httpclient_add_test_executable(httpclient_cancel_stress_test src/httpclient_cancel_stress_test.cpp httpclient)
 httpclient_add_test_executable(httpclient_api_test src/httpclient_api_test.cpp httpclient)
 httpclient_add_test_executable(proxy_transport_test src/proxy_transport_test.cpp httpclient)
 httpclient_add_test_executable(asyncx_test src/asyncx_test.cpp)
@@ -149,6 +150,12 @@ if(BUILD_TESTING)
               $<TARGET_FILE_DIR:request_transport_test>
   )
   set_tests_properties(request_transport_smoke PROPERTIES TIMEOUT 30)
+  add_test(
+      NAME httpclient_cancel_stress
+      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/smoke_httpclient_cancel_stress.sh
+              $<TARGET_FILE_DIR:httpclient_cancel_stress_test>
+  )
+  set_tests_properties(httpclient_cancel_stress PROPERTIES TIMEOUT 45)
   add_test(
       NAME httpclient_local_smoke
       COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/smoke_httpclient_local.sh
