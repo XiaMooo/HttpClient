@@ -1416,80 +1416,74 @@ asio::awaitable<void> for_each_limited(std::size_t total, std::size_t concurrenc
   auto group = std::make_shared<detail::LimitedForEachState>(total);
   group->wake = std::make_shared<asio::steady_timer>(ex);
   group->wake->expires_at(asio::steady_timer::time_point::max());
-  struct Launcher : std::enable_shared_from_this<Launcher> {
-    Launcher(asio::any_io_executor ex,
-             std::shared_ptr<detail::LimitedForEachState> group, FnType fn,
-             OnResultType on_result)
-        : ex(std::move(ex)),
-          group(std::move(group)),
+  struct Workers {
+    Workers(std::shared_ptr<detail::LimitedForEachState> group, FnType fn,
+            OnResultType on_result)
+        : group(std::move(group)),
           fn(std::move(fn)),
           on_result(std::move(on_result)) {}
 
-    asio::any_io_executor ex;
     std::shared_ptr<detail::LimitedForEachState> group;
     FnType fn;
     OnResultType on_result;
 
-    void launch_one() {
-      if (group->stop.load()) {
-        return;
-      }
-
-      auto index = group->next.fetch_add(1);
-      if (index >= group->total) {
-        return;
-      }
-
-      auto self = this->shared_from_this();
-      asio::co_spawn(
-          ex,
-          [self, index]() mutable -> asio::awaitable<void> {
-          std::exception_ptr error;
-          try {
-            auto awaitable = self->fn(index);
-            if constexpr (std::is_void_v<T>) {
-              co_await std::move(awaitable);
-              self->on_result(index, std::monostate{});
-            } else {
-              auto value = co_await std::move(awaitable);
-              self->on_result(index, std::move(value));
-            }
-          } catch (...) {
-            error = detail::normalize_exception(std::current_exception());
-          }
-
-          if (error) {
-            bool should_wake = false;
-            {
-              std::lock_guard<std::mutex> lock(self->group->mutex);
-              if (!self->group->first_error) {
-                self->group->first_error = error;
-                should_wake = true;
-              }
-            }
-            self->group->stop.store(true);
-            if (should_wake && !self->group->wake_once.exchange(true)) {
-              self->group->wake->cancel();
-            }
-          } else {
-            self->launch_one();
-          }
-
-          if (self->group->completed.fetch_add(1) + 1 == self->group->total) {
-            if (!self->group->wake_once.exchange(true)) {
-              self->group->wake->cancel();
-            }
-          }
+    asio::awaitable<void> run() {
+      for (;;) {
+        if (group->stop.load()) {
           co_return;
-        },
-        asio::detached);
+        }
+        auto index = group->next.fetch_add(1);
+        if (index >= group->total) {
+          co_return;
+        }
+
+        std::exception_ptr error;
+        try {
+          auto awaitable = fn(index);
+          if constexpr (std::is_void_v<T>) {
+            co_await std::move(awaitable);
+            on_result(index, std::monostate{});
+          } else {
+            auto value = co_await std::move(awaitable);
+            on_result(index, std::move(value));
+          }
+        } catch (...) {
+          error = detail::normalize_exception(std::current_exception());
+        }
+
+        if (error) {
+          bool should_wake = false;
+          {
+            std::lock_guard<std::mutex> lock(group->mutex);
+            if (!group->first_error) {
+              group->first_error = error;
+              should_wake = true;
+            }
+          }
+          group->stop.store(true);
+          if (should_wake && !group->wake_once.exchange(true)) {
+            group->wake->cancel();
+          }
+        }
+
+        if (group->completed.fetch_add(1) + 1 == group->total) {
+          if (!group->wake_once.exchange(true)) {
+            group->wake->cancel();
+          }
+        }
+      }
     }
   };
-  auto launcher = std::make_shared<Launcher>(
-      ex, group, std::forward<Fn>(fn), std::forward<OnResult>(on_result));
+  auto workers = std::make_shared<Workers>(
+      group, std::forward<Fn>(fn), std::forward<OnResult>(on_result));
 
   for (std::size_t i = 0; i < concurrency; ++i) {
-    launcher->launch_one();
+    asio::co_spawn(
+        ex,
+        [workers]() mutable -> asio::awaitable<void> {
+          co_await workers->run();
+        },
+        asio::detached);
   }
 
   while (group->completed.load() < group->total) {
