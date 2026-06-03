@@ -23,6 +23,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -406,48 +407,22 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   };
 
   if (args.warmup_per_url > 0 && args.concurrent_warmup) {
-    struct WarmupState {
-      std::atomic<int> issued = 0;
-      std::atomic<int> completed = 0;
-      std::atomic<int> printed = 0;
-    };
-    auto warmup_state = std::make_shared<WarmupState>();
-    auto warmup_done = std::make_shared<asio::steady_timer>(ex);
-    warmup_done->expires_at(asio::steady_timer::time_point::max());
-    auto warmup_one = std::make_shared<std::function<void()>>();
-    std::weak_ptr<std::function<void()>> weak_warmup_one = warmup_one;
-    *warmup_one = [&, warmup_state, warmup_done, weak_warmup_one]() {
-      auto id = warmup_state->issued.fetch_add(1);
-      auto total = args.warmup_per_url * static_cast<int>(urls.size());
-      if (id >= total) {
-        return;
-      }
-      auto url = urls[static_cast<std::size_t>(id % static_cast<int>(urls.size()))];
-      client.async_request_callback(
-          make_request(url),
-          [&, warmup_state, warmup_done, weak_warmup_one](httpclient::Response resp) mutable {
-            if (!resp.error.empty() && warmup_state->printed.fetch_add(1) < 3) {
-              std::cerr << "warmup_error=" << resp.error << "\n";
-            }
-            if (warmup_state->completed.fetch_add(1) + 1 ==
-                args.warmup_per_url * static_cast<int>(urls.size())) {
-              warmup_done->cancel();
-            }
-            if (auto warmup_one = weak_warmup_one.lock()) {
-              (*warmup_one)();
-            }
-          });
-    };
-    auto starters = std::min(args.concurrency,
-                             args.warmup_per_url * static_cast<int>(urls.size()));
-    for (int i = 0; i < starters; ++i) {
-      (*warmup_one)();
-    }
-    if (warmup_state->completed.load() <
-        args.warmup_per_url * static_cast<int>(urls.size())) {
-      boost::system::error_code ec;
-      co_await warmup_done->async_wait(asio::redirect_error(asio::use_awaitable, ec));
-    }
+    auto total = static_cast<std::size_t>(
+        args.warmup_per_url * static_cast<int>(urls.size()));
+    auto warmup_concurrency =
+        static_cast<std::size_t>(std::max(1, std::min(args.concurrency,
+                                                      static_cast<int>(total))));
+    std::atomic<int> printed = 0;
+    co_await asyncx::for_each_limited(
+        total, warmup_concurrency, [&](std::size_t id) -> asio::awaitable<void> {
+          auto url = urls[id % urls.size()];
+          auto resp = co_await client.async_request(make_request(url));
+          if (!resp.error.empty() && printed.fetch_add(1) < 3) {
+            std::cerr << "warmup_error=" << resp.error << "\n";
+          }
+          co_return;
+        },
+        [](std::size_t, std::monostate) {});
   } else if (args.warmup_per_url > 0 && args.sequential_warmup) {
     for (int round = 0; round < args.warmup_per_url; ++round) {
       for (const auto& url : urls) {
