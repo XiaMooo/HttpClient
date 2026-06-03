@@ -173,6 +173,8 @@ struct Args {
   int h1_actor_connections_per_origin = 8;
   int warmup_per_url = 0;
   int preconnect_per_url = 0;
+  int max_retries = 0;
+  int timeout_ms = 5000;
   bool reset_connections_after_warmup = false;
   bool concurrent_warmup = false;
   bool sequential_warmup = false;
@@ -235,6 +237,10 @@ Args parse_args(int argc, char** argv) {
       args.warmup_per_url = std::atoi(argv[++i]);
     } else if (next("--preconnect-per-url")) {
       args.preconnect_per_url = std::atoi(argv[++i]);
+    } else if (next("--max-retries")) {
+      args.max_retries = std::atoi(argv[++i]);
+    } else if (next("--timeout-ms")) {
+      args.timeout_ms = std::atoi(argv[++i]);
     } else if (s == "--reset-connections-after-warmup") {
       args.reset_connections_after_warmup = true;
     } else if (s == "--concurrent-warmup") {
@@ -419,7 +425,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     req.url = url;
     req.method = payload->empty() ? "GET" : "POST";
     req.body = *payload;
-    req.timeout_ms = 5000;
+    req.timeout_ms = args.timeout_ms;
     req.verify_peer = !args.insecure;
     req.verify_host = !args.insecure;
     req.disable_proxy = args.no_proxy;
@@ -427,6 +433,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     req.protocol_policy = args.policy;
     req.store_response_body = args.store_response;
     req.store_response_headers = args.store_response;
+    req.max_retries = args.max_retries;
     return req;
   };
 

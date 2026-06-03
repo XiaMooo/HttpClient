@@ -278,6 +278,21 @@ bool is_retry_status(long status, const std::vector<int>& statuses) {
          statuses.end();
 }
 
+bool is_retriable_method(std::string_view method) {
+  auto lower = lower_copy(method);
+  return lower == "get" || lower == "head" || lower == "options" ||
+         lower == "delete" || lower == "put";
+}
+
+bool is_retriable_transport_error(std::string_view error) {
+  return error.find("h1_read_headers") != std::string_view::npos ||
+         error.find("h1_read_body") != std::string_view::npos ||
+         error.find("h1_write") != std::string_view::npos ||
+         error.find("End of file") != std::string_view::npos ||
+         error.find("timeout") != std::string_view::npos ||
+         error.find("operation_aborted") != std::string_view::npos;
+}
+
 std::string zlib_decode(std::string_view input, int window_bits) {
   z_stream stream{};
   if (inflateInit2(&stream, window_bits) != Z_OK) {
@@ -898,9 +913,13 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
         ++redirects;
       }
 
-      if (attempt >= max_retries ||
-          (last.error.empty() &&
-           !is_retry_status(last.status, options_.retry_statuses))) {
+      const bool retry_status =
+          last.error.empty() &&
+          is_retry_status(last.status, options_.retry_statuses);
+      const bool retry_transport =
+          !last.error.empty() && is_retriable_method(request.method) &&
+          is_retriable_transport_error(last.error);
+      if (attempt >= max_retries || (!retry_status && !retry_transport)) {
         co_return last;
       }
       if (retry_backoff.count() > 0) {
