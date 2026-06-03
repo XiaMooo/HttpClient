@@ -251,6 +251,44 @@ std::chrono::milliseconds effective_timeout(const Request& request,
   return std::chrono::milliseconds(value);
 }
 
+struct H1ExchangeTimings {
+  std::atomic<std::uint64_t>* write_count = nullptr;
+  std::atomic<std::uint64_t>* write_total_us = nullptr;
+  std::atomic<std::uint64_t>* write_max_us = nullptr;
+  std::atomic<std::uint64_t>* read_headers_count = nullptr;
+  std::atomic<std::uint64_t>* read_headers_total_us = nullptr;
+  std::atomic<std::uint64_t>* read_headers_max_us = nullptr;
+  std::atomic<std::uint64_t>* read_body_count = nullptr;
+  std::atomic<std::uint64_t>* read_body_total_us = nullptr;
+  std::atomic<std::uint64_t>* read_body_max_us = nullptr;
+  std::atomic<std::uint64_t>* exchange_count = nullptr;
+  std::atomic<std::uint64_t>* exchange_total_us = nullptr;
+  std::atomic<std::uint64_t>* exchange_max_us = nullptr;
+};
+
+void record_atomic_timing(std::atomic<std::uint64_t>* count,
+                          std::atomic<std::uint64_t>* total,
+                          std::atomic<std::uint64_t>* max,
+                          std::uint64_t us) {
+  if (!count || !total || !max) {
+    return;
+  }
+  count->fetch_add(1, std::memory_order_relaxed);
+  total->fetch_add(us, std::memory_order_relaxed);
+  auto current = max->load(std::memory_order_relaxed);
+  while (current < us &&
+         !max->compare_exchange_weak(current, us, std::memory_order_relaxed,
+                                     std::memory_order_relaxed)) {
+  }
+}
+
+std::uint64_t elapsed_us_since(std::chrono::steady_clock::time_point start) {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count());
+}
+
 template <class Stream>
 asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& read_buf,
                                                 std::string& write_buf,
@@ -258,7 +296,8 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
                                                 std::chrono::steady_clock::time_point start,
                                                 std::chrono::milliseconds write_timeout,
                                                 std::chrono::milliseconds read_timeout,
-                                                bool absolute_target = false) {
+                                                bool absolute_target = false,
+                                                const H1ExchangeTimings* timings = nullptr) {
   write_buf.reserve(256 + request.body.size());
   write_buf.clear();
   write_buf.append(request.method.empty() ? "GET" : request.method);
@@ -300,6 +339,8 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
   write_buf.append("Connection: keep-alive\r\n\r\n");
   write_buf.append(request.body);
 
+  auto exchange_started = std::chrono::steady_clock::now();
+  auto write_started = exchange_started;
   try {
     if constexpr (requires { beast::get_lowest_layer(stream).expires_after(write_timeout); }) {
       beast::get_lowest_layer(stream).expires_after(write_timeout);
@@ -310,10 +351,15 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
   } catch (const std::exception& e) {
     throw stage_error("h1_write", e);
   }
+  if (timings) {
+    record_atomic_timing(timings->write_count, timings->write_total_us,
+                         timings->write_max_us, elapsed_us_since(write_started));
+  }
 
   read_buf.clear();
   std::array<char, 32768> tmp{};
   std::size_t header_end = std::string::npos;
+  auto read_headers_started = std::chrono::steady_clock::now();
   for (;;) {
     std::size_t n = 0;
     try {
@@ -335,6 +381,12 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
       throw std::runtime_error("h1 response headers too large");
     }
   }
+  if (timings) {
+    record_atomic_timing(timings->read_headers_count,
+                         timings->read_headers_total_us,
+                         timings->read_headers_max_us,
+                         elapsed_us_since(read_headers_started));
+  }
 
   auto headers = std::string_view(read_buf.data(), header_end + 4);
   auto content_length = parse_content_length(headers);
@@ -345,6 +397,7 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
                                   std::min(have_body, content_length));
     request.on_body_chunk(chunk);
   }
+  auto read_body_started = std::chrono::steady_clock::now();
   while (have_body < content_length) {
     auto remaining = content_length - have_body;
     std::size_t n = 0;
@@ -367,6 +420,12 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
     }
     have_body += n;
   }
+  if (timings) {
+    record_atomic_timing(timings->read_body_count,
+                         timings->read_body_total_us,
+                         timings->read_body_max_us,
+                         elapsed_us_since(read_body_started));
+  }
 
   Response response;
   response.status = parse_status_code(headers);
@@ -380,6 +439,11 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
   if (request.measure_total_time) {
     response.total_time_sec =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  }
+  if (timings) {
+    record_atomic_timing(timings->exchange_count, timings->exchange_total_us,
+                         timings->exchange_max_us,
+                         elapsed_us_since(exchange_started));
   }
   co_return response;
 }
@@ -399,7 +463,9 @@ asio::awaitable<Response> run_http_exchange(Stream& stream, beast::flat_buffer& 
                                             std::chrono::steady_clock::time_point start,
                                             std::chrono::milliseconds write_timeout,
                                             std::chrono::milliseconds read_timeout,
-                                            bool absolute_target = false) {
+                                            bool absolute_target = false,
+                                            const H1ExchangeTimings* timings = nullptr) {
+  auto exchange_started = std::chrono::steady_clock::now();
   buffer.consume(buffer.size());
   http::request<http::string_body> req{
       parse_method(request.method), absolute_target ? absolute_uri(url) : url.target,
@@ -415,20 +481,32 @@ asio::awaitable<Response> run_http_exchange(Stream& stream, beast::flat_buffer& 
   req.body() = std::move(request.body);
   req.prepare_payload();
 
+  auto write_started = std::chrono::steady_clock::now();
   if constexpr (requires { beast::get_lowest_layer(stream).expires_after(write_timeout); }) {
     beast::get_lowest_layer(stream).expires_after(write_timeout);
   } else {
     stream.expires_after(write_timeout);
   }
   co_await http::async_write(stream, req, asio::use_awaitable);
+  if (timings) {
+    record_atomic_timing(timings->write_count, timings->write_total_us,
+                         timings->write_max_us, elapsed_us_since(write_started));
+  }
 
   http::response<http::string_body> res;
+  auto read_started = std::chrono::steady_clock::now();
   if constexpr (requires { beast::get_lowest_layer(stream).expires_after(read_timeout); }) {
     beast::get_lowest_layer(stream).expires_after(read_timeout);
   } else {
     stream.expires_after(read_timeout);
   }
   co_await http::async_read(stream, buffer, res, asio::use_awaitable);
+  if (timings) {
+    record_atomic_timing(timings->read_headers_count,
+                         timings->read_headers_total_us,
+                         timings->read_headers_max_us,
+                         elapsed_us_since(read_started));
+  }
   Response response;
   response.status = static_cast<long>(res.result_int());
   if (request.store_response_body) {
@@ -447,6 +525,11 @@ asio::awaitable<Response> run_http_exchange(Stream& stream, beast::flat_buffer& 
     response.total_time_sec =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   }
+  if (timings) {
+    record_atomic_timing(timings->exchange_count, timings->exchange_total_us,
+                         timings->exchange_max_us,
+                         elapsed_us_since(exchange_started));
+  }
   co_return response;
 }
 
@@ -455,6 +538,12 @@ asio::awaitable<Response> run_http_exchange(Stream& stream, beast::flat_buffer& 
 struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
   struct OriginPool;
   struct H1TlsActor;
+
+  struct AtomicTimingStats {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> total_us{0};
+    std::atomic<std::uint64_t> max_us{0};
+  };
 
   struct Shard {
     asio::io_context io;
@@ -563,7 +652,57 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     std::atomic<std::uint64_t> h1_cancelled{0};
     std::atomic<std::uint64_t> h1_pool_wait_cancelled{0};
     std::atomic<std::uint64_t> h1_close_on_cancel{0};
+    AtomicTimingStats h1_pool_wait;
+    AtomicTimingStats h1_connect;
+    AtomicTimingStats h1_acquire;
+    AtomicTimingStats h1_write;
+    AtomicTimingStats h1_read_headers;
+    AtomicTimingStats h1_read_body;
+    AtomicTimingStats h1_exchange;
   };
+
+  static std::uint64_t elapsed_us(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count());
+  }
+
+  static void record_timing(AtomicTimingStats& stats, std::uint64_t us) {
+    stats.count.fetch_add(1, std::memory_order_relaxed);
+    stats.total_us.fetch_add(us, std::memory_order_relaxed);
+    auto current = stats.max_us.load(std::memory_order_relaxed);
+    while (current < us &&
+           !stats.max_us.compare_exchange_weak(current, us, std::memory_order_relaxed,
+                                               std::memory_order_relaxed)) {
+    }
+  }
+
+  static AsioHttpClient::Stats::TimingStats snapshot_timing(
+      const AtomicTimingStats& stats) {
+    return AsioHttpClient::Stats::TimingStats{
+        stats.count.load(std::memory_order_relaxed),
+        stats.total_us.load(std::memory_order_relaxed),
+        stats.max_us.load(std::memory_order_relaxed),
+    };
+  }
+
+  H1ExchangeTimings h1_exchange_timings() {
+    return H1ExchangeTimings{
+        &stats_.h1_write.count,
+        &stats_.h1_write.total_us,
+        &stats_.h1_write.max_us,
+        &stats_.h1_read_headers.count,
+        &stats_.h1_read_headers.total_us,
+        &stats_.h1_read_headers.max_us,
+        &stats_.h1_read_body.count,
+        &stats_.h1_read_body.total_us,
+        &stats_.h1_read_body.max_us,
+        &stats_.h1_exchange.count,
+        &stats_.h1_exchange.total_us,
+        &stats_.h1_exchange.max_us,
+    };
+  }
 
   static void remove_waiter(WaiterQueue& queue, const WaiterPtr& waiter) {
     queue.erase(std::remove(queue.begin(), queue.end(), waiter), queue.end());
@@ -1078,6 +1217,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       std::chrono::milliseconds connect_timeout,
       std::chrono::milliseconds pool_timeout,
       std::shared_ptr<RequestCancelState> cancel_state = {}) {
+    auto acquire_started = std::chrono::steady_clock::now();
     const auto pool_deadline = std::chrono::steady_clock::now() + pool_timeout;
     const auto max_connections =
         std::max<std::size_t>(1, options_.max_connections_per_origin);
@@ -1097,6 +1237,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
         conn.reused = true;
         ++stats_.h1_idle_hit;
         ++stats_.h1_conn_reused;
+        record_timing(stats_.h1_acquire, elapsed_us(acquire_started));
         co_return conn;
       }
       if (has_idle_reservation && pool->idle_plain.empty()) {
@@ -1111,6 +1252,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
         ++pool->active_plain;
         ++stats_.h1_idle_miss;
         try {
+          auto connect_started = std::chrono::steady_clock::now();
           auto new_conn =
               std::make_unique<PlainConnection>(co_await asio::this_coro::executor);
           ++stats_.h1_conn_created;
@@ -1121,6 +1263,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
           co_await new_conn->stream.async_connect(results, asio::use_awaitable);
           boost::system::error_code option_ec;
           new_conn->stream.socket().set_option(tcp::no_delay(true), option_ec);
+          record_timing(stats_.h1_connect, elapsed_us(connect_started));
+          record_timing(stats_.h1_acquire, elapsed_us(acquire_started));
           co_return AcquiredConnection{std::move(new_conn), {}, false};
         } catch (...) {
           if (pool->active_plain > 0) {
@@ -1141,7 +1285,9 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
                                    : asio::steady_timer::time_point::max());
       pool->wait_plain.push_back(waiter);
       boost::system::error_code ec;
+      auto wait_started = std::chrono::steady_clock::now();
       co_await waiter->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+      record_timing(stats_.h1_pool_wait, elapsed_us(wait_started));
       if (cancel_state) {
         cancel_state->waiter.reset();
       }
@@ -1244,6 +1390,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       std::chrono::milliseconds connect_timeout,
       std::chrono::milliseconds pool_timeout,
       std::shared_ptr<RequestCancelState> cancel_state = {}) {
+    auto acquire_started = std::chrono::steady_clock::now();
     const auto pool_deadline = std::chrono::steady_clock::now() + pool_timeout;
     const auto max_connections =
         std::max<std::size_t>(1, options_.max_connections_per_origin);
@@ -1263,6 +1410,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
         conn.reused = true;
         ++stats_.h1_idle_hit;
         ++stats_.h1_conn_reused;
+        record_timing(stats_.h1_acquire, elapsed_us(acquire_started));
         co_return conn;
       }
       if (has_idle_reservation && pool->idle_tls.empty()) {
@@ -1284,7 +1432,9 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
                                      : asio::steady_timer::time_point::max());
         pool->wait_tls.push_back(waiter);
         boost::system::error_code ec;
+        auto wait_started = std::chrono::steady_clock::now();
         co_await waiter->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        record_timing(stats_.h1_pool_wait, elapsed_us(wait_started));
         if (cancel_state) {
           cancel_state->waiter.reset();
         }
@@ -1309,6 +1459,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     }
 
     try {
+      auto connect_started = std::chrono::steady_clock::now();
       auto new_conn =
           std::make_unique<TlsConnection>(co_await asio::this_coro::executor,
                                           pool->ssl_ctx);
@@ -1338,6 +1489,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
           .set_option(tcp::no_delay(true), option_ec);
       co_await new_conn->stream.async_handshake(asio::ssl::stream_base::client,
                                                 asio::use_awaitable);
+      record_timing(stats_.h1_connect, elapsed_us(connect_started));
+      record_timing(stats_.h1_acquire, elapsed_us(acquire_started));
       co_return AcquiredConnection{{}, std::move(new_conn), false};
     } catch (...) {
       if (pool->active_tls > 0) {
@@ -1352,6 +1505,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       std::shared_ptr<OriginPool> pool, const ParsedUrl& url, const Request& request,
       std::chrono::milliseconds connect_timeout,
       std::chrono::milliseconds pool_timeout) {
+    auto acquire_started = std::chrono::steady_clock::now();
     const auto max_connections =
         std::max<std::size_t>(1, options_.max_connections_per_origin);
     const auto pool_deadline = std::chrono::steady_clock::now() + pool_timeout;
@@ -1365,7 +1519,9 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
                                    : asio::steady_timer::time_point::max());
       pool->wait_tls.push_back(waiter);
       boost::system::error_code ec;
+      auto wait_started = std::chrono::steady_clock::now();
       co_await waiter->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+      record_timing(stats_.h1_pool_wait, elapsed_us(wait_started));
       if (ec == asio::error::operation_aborted && !waiter->woken) {
         waiter->cancelled = true;
         remove_waiter(pool->wait_tls, waiter);
@@ -1386,10 +1542,12 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       auto conn = std::move(pool->idle_tls.back());
       pool->idle_tls.pop_back();
       set_h2_h1_alpn(conn->stream.native_handle());
+      record_timing(stats_.h1_acquire, elapsed_us(acquire_started));
       co_return conn;
     }
     ++pool->active_tls;
     try {
+      auto connect_started = std::chrono::steady_clock::now();
       auto conn =
           std::make_unique<TlsConnection>(co_await asio::this_coro::executor,
                                           pool->ssl_ctx);
@@ -1418,6 +1576,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
           .set_option(tcp::no_delay(true), option_ec);
       co_await conn->stream.async_handshake(asio::ssl::stream_base::client,
                                             asio::use_awaitable);
+      record_timing(stats_.h1_connect, elapsed_us(connect_started));
+      record_timing(stats_.h1_acquire, elapsed_us(acquire_started));
       co_return conn;
     } catch (...) {
       if (pool->active_tls > 0) {
@@ -1439,6 +1599,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     auto write_timeout = effective_timeout(request, &Request::Timeout::write_ms);
     auto read_timeout = effective_timeout(request, &Request::Timeout::read_ms);
     auto proxy = proxy_support::proxy_for_request(request);
+    auto timings = h1_exchange_timings();
     if (proxy.enabled) {
       auto proxy_connect_url = proxy_url_as_parsed(proxy.url);
       if (url.tls) {
@@ -1570,12 +1731,13 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
                                                     tls_conn->read_buffer,
                                                     tls_conn->write_buffer, url,
                                                     std::move(request), start,
-                                                    write_timeout, read_timeout);
+                                                    write_timeout, read_timeout, false,
+                                                    &timings);
         } else {
           response =
               co_await run_http_exchange(tls_conn->stream, tls_conn->buffer, url,
                                          std::move(request), start, write_timeout,
-                                         read_timeout);
+                                         read_timeout, false, &timings);
         }
       } catch (const std::exception& e) {
         if (cancel_state) {
@@ -1630,12 +1792,13 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
                                                   plain_conn->read_buffer,
                                                   plain_conn->write_buffer, url,
                                                   std::move(request), start,
-                                                  write_timeout, read_timeout);
+                                                  write_timeout, read_timeout, false,
+                                                  &timings);
       } else {
         response =
             co_await run_http_exchange(plain_conn->stream, plain_conn->buffer, url,
                                        std::move(request), start, write_timeout,
-                                       read_timeout);
+                                       read_timeout, false, &timings);
       }
     } catch (const std::exception& e) {
       if (cancel_state) {
@@ -1703,6 +1866,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
             auto conn = co_await self->connect_probe_tls(pool, url, request,
                                                          connect_timeout,
                                                          pool_timeout);
+            auto timings = self->h1_exchange_timings();
             auto protocol = selected_alpn(conn->stream.native_handle());
             result.protocol = protocol;
             if (protocol == ProbeProtocol::H2) {
@@ -1723,12 +1887,14 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
                                                                conn->write_buffer, url,
                                                                std::move(request), start,
                                                                write_timeout,
-                                                               read_timeout);
+                                                               read_timeout, false,
+                                                               &timings);
             } else {
               result.response =
                   co_await run_http_exchange(conn->stream, conn->buffer, url,
                                              std::move(request), start,
-                                             write_timeout, read_timeout);
+                                             write_timeout, read_timeout, false,
+                                             &timings);
             }
             if (result.response.error.empty()) {
               pool->idle_tls.push_back(std::move(conn));
@@ -1933,6 +2099,13 @@ AsioHttpClient::Stats AsioHttpClient::stats() const {
       impl_->stats_.h1_cancelled.load(),
       impl_->stats_.h1_pool_wait_cancelled.load(),
       impl_->stats_.h1_close_on_cancel.load(),
+      Impl::snapshot_timing(impl_->stats_.h1_pool_wait),
+      Impl::snapshot_timing(impl_->stats_.h1_connect),
+      Impl::snapshot_timing(impl_->stats_.h1_acquire),
+      Impl::snapshot_timing(impl_->stats_.h1_write),
+      Impl::snapshot_timing(impl_->stats_.h1_read_headers),
+      Impl::snapshot_timing(impl_->stats_.h1_read_body),
+      Impl::snapshot_timing(impl_->stats_.h1_exchange),
   };
 }
 

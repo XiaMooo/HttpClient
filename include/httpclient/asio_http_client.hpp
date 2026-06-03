@@ -32,6 +32,12 @@ public:
   };
 
   struct Stats {
+    struct TimingStats {
+      std::uint64_t count = 0;
+      std::uint64_t total_us = 0;
+      std::uint64_t max_us = 0;
+    };
+
     std::uint64_t h1_conn_created = 0;
     std::uint64_t h1_idle_hit = 0;
     std::uint64_t h1_idle_miss = 0;
@@ -43,6 +49,13 @@ public:
     std::uint64_t h1_cancelled = 0;
     std::uint64_t h1_pool_wait_cancelled = 0;
     std::uint64_t h1_close_on_cancel = 0;
+    TimingStats h1_pool_wait;
+    TimingStats h1_connect;
+    TimingStats h1_acquire;
+    TimingStats h1_write;
+    TimingStats h1_read_headers;
+    TimingStats h1_read_body;
+    TimingStats h1_exchange;
   };
 
   struct Options {

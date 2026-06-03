@@ -92,6 +92,14 @@ Args parse_args(int argc, char** argv) {
 
 AsioHttpClient::Stats diff_stats(const AsioHttpClient::Stats& after,
                                  const AsioHttpClient::Stats& before) {
+  auto diff_timing = [](const AsioHttpClient::Stats::TimingStats& a,
+                        const AsioHttpClient::Stats::TimingStats& b) {
+    return AsioHttpClient::Stats::TimingStats{
+        a.count - b.count,
+        a.total_us - b.total_us,
+        a.max_us,
+    };
+  };
   return AsioHttpClient::Stats{
       after.h1_conn_created - before.h1_conn_created,
       after.h1_idle_hit - before.h1_idle_hit,
@@ -101,7 +109,21 @@ AsioHttpClient::Stats diff_stats(const AsioHttpClient::Stats& after,
       after.h1_close_after_response - before.h1_close_after_response,
       after.h1_reuse_failed - before.h1_reuse_failed,
       after.h1_reconnect_after_idle - before.h1_reconnect_after_idle,
+      after.h1_cancelled - before.h1_cancelled,
+      after.h1_pool_wait_cancelled - before.h1_pool_wait_cancelled,
+      after.h1_close_on_cancel - before.h1_close_on_cancel,
+      diff_timing(after.h1_pool_wait, before.h1_pool_wait),
+      diff_timing(after.h1_connect, before.h1_connect),
+      diff_timing(after.h1_acquire, before.h1_acquire),
+      diff_timing(after.h1_write, before.h1_write),
+      diff_timing(after.h1_read_headers, before.h1_read_headers),
+      diff_timing(after.h1_read_body, before.h1_read_body),
+      diff_timing(after.h1_exchange, before.h1_exchange),
   };
+}
+
+std::uint64_t avg_us(const AsioHttpClient::Stats::TimingStats& stats) {
+  return stats.count == 0 ? 0 : stats.total_us / stats.count;
 }
 
 asio::awaitable<void> run_bench(Args args) {
@@ -277,6 +299,27 @@ asio::awaitable<void> run_bench(Args args) {
             << " h1_close_after_response=" << stats.h1_close_after_response
             << " h1_reuse_failed=" << stats.h1_reuse_failed
             << " h1_reconnect_after_idle=" << stats.h1_reconnect_after_idle
+            << " h1_pool_wait_count=" << stats.h1_pool_wait.count
+            << " h1_pool_wait_avg_us=" << avg_us(stats.h1_pool_wait)
+            << " h1_pool_wait_max_seen_us=" << stats.h1_pool_wait.max_us
+            << " h1_connect_count=" << stats.h1_connect.count
+            << " h1_connect_avg_us=" << avg_us(stats.h1_connect)
+            << " h1_connect_max_seen_us=" << stats.h1_connect.max_us
+            << " h1_acquire_count=" << stats.h1_acquire.count
+            << " h1_acquire_avg_us=" << avg_us(stats.h1_acquire)
+            << " h1_acquire_max_seen_us=" << stats.h1_acquire.max_us
+            << " h1_write_count=" << stats.h1_write.count
+            << " h1_write_avg_us=" << avg_us(stats.h1_write)
+            << " h1_write_max_seen_us=" << stats.h1_write.max_us
+            << " h1_read_headers_count=" << stats.h1_read_headers.count
+            << " h1_read_headers_avg_us=" << avg_us(stats.h1_read_headers)
+            << " h1_read_headers_max_seen_us=" << stats.h1_read_headers.max_us
+            << " h1_read_body_count=" << stats.h1_read_body.count
+            << " h1_read_body_avg_us=" << avg_us(stats.h1_read_body)
+            << " h1_read_body_max_seen_us=" << stats.h1_read_body.max_us
+            << " h1_exchange_count=" << stats.h1_exchange.count
+            << " h1_exchange_avg_us=" << avg_us(stats.h1_exchange)
+            << " h1_exchange_max_seen_us=" << stats.h1_exchange.max_us
             << "\n";
 }
 

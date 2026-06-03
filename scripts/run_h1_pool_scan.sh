@@ -52,6 +52,8 @@ print_row() {
   local round="$3"
   local output="$4"
   local wall p50 p95 p99 cpu_user cpu_system rss peak created idle_hit
+  local pool_wait_avg pool_wait_max connect_avg connect_max acquire_avg acquire_max
+  local write_avg write_max read_headers_avg read_headers_max exchange_avg exchange_max
   wall="$(printf '%s\n' "$output" | extract_field wall_ms)"
   p50="$(printf '%s\n' "$output" | extract_field p50_us)"
   p95="$(printf '%s\n' "$output" | extract_field p95_us)"
@@ -62,15 +64,39 @@ print_row() {
   peak="$(printf '%s\n' "$output" | extract_field peak_rss_kb)"
   created="$(printf '%s\n' "$output" | extract_field h1_conn_created)"
   idle_hit="$(printf '%s\n' "$output" | extract_field h1_idle_hit)"
-  printf '| %s | %s | %s | %s | %s/%s/%s | %s/%s | %s | %s | %s | %s |\n' \
+  pool_wait_avg="$(printf '%s\n' "$output" | extract_field h1_pool_wait_avg_us)"
+  pool_wait_max="$(printf '%s\n' "$output" | extract_field h1_pool_wait_max_seen_us)"
+  connect_avg="$(printf '%s\n' "$output" | extract_field h1_connect_avg_us)"
+  connect_max="$(printf '%s\n' "$output" | extract_field h1_connect_max_seen_us)"
+  acquire_avg="$(printf '%s\n' "$output" | extract_field h1_acquire_avg_us)"
+  acquire_max="$(printf '%s\n' "$output" | extract_field h1_acquire_max_seen_us)"
+  write_avg="$(printf '%s\n' "$output" | extract_field h1_write_avg_us)"
+  write_max="$(printf '%s\n' "$output" | extract_field h1_write_max_seen_us)"
+  read_headers_avg="$(printf '%s\n' "$output" | extract_field h1_read_headers_avg_us)"
+  read_headers_max="$(printf '%s\n' "$output" | extract_field h1_read_headers_max_seen_us)"
+  exchange_avg="$(printf '%s\n' "$output" | extract_field h1_exchange_avg_us)"
+  exchange_max="$(printf '%s\n' "$output" | extract_field h1_exchange_max_seen_us)"
+  printf '| %s | %s | %s | %s | %s/%s/%s | %s/%s | %s | %s | %s | %s | %s/%s | %s/%s | %s/%s | %s/%s | %s/%s | %s/%s |\n' \
     "$round" "$max_conn" "$mode" "${wall:-error}" "${p50:--}" "${p95:--}" "${p99:--}" \
     "${cpu_user:--}" "${cpu_system:--}" "${rss:--}" "${peak:--}" \
-    "${created:--}" "${idle_hit:--}"
+    "${created:--}" "${idle_hit:--}" \
+    "${pool_wait_avg:--}" "${pool_wait_max:--}" \
+    "${connect_avg:--}" "${connect_max:--}" \
+    "${acquire_avg:--}" "${acquire_max:--}" \
+    "${write_avg:--}" "${write_max:--}" \
+    "${read_headers_avg:--}" "${read_headers_max:--}" \
+    "${exchange_avg:--}" "${exchange_max:--}"
   if [[ -n "$CSV_TARGET" ]]; then
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$round" "$max_conn" "$mode" "${wall:-}" "${p50:-}" "${p95:-}" \
       "${p99:-}" "${cpu_user:-}" "${cpu_system:-}" "${rss:-}" "${peak:-}" \
-      "${created:-}" >>"$CSV_TARGET"
+      "${created:-}" "${idle_hit:-}" \
+      "${pool_wait_avg:-}" "${pool_wait_max:-}" \
+      "${connect_avg:-}" "${connect_max:-}" \
+      "${acquire_avg:-}" "${acquire_max:-}" \
+      "${write_avg:-}" "${write_max:-}" \
+      "${read_headers_avg:-}" "${read_headers_max:-}" \
+      "${exchange_avg:-}" "${exchange_max:-}" >>"$CSV_TARGET"
   fi
 }
 
@@ -112,7 +138,7 @@ done
 
 if [[ -n "$CSV_TARGET" ]]; then
   mkdir -p "$(dirname "$CSV_TARGET")"
-  printf 'round,max_conn,mode,wall_ms,p50_us,p95_us,p99_us,cpu_user_ms,cpu_system_ms,rss_kb,peak_rss_kb,h1_created\n' >"$CSV_TARGET"
+  printf 'round,max_conn,mode,wall_ms,p50_us,p95_us,p99_us,cpu_user_ms,cpu_system_ms,rss_kb,peak_rss_kb,h1_created,h1_idle_hit,h1_pool_wait_avg_us,h1_pool_wait_max_seen_us,h1_connect_avg_us,h1_connect_max_seen_us,h1_acquire_avg_us,h1_acquire_max_seen_us,h1_write_avg_us,h1_write_max_seen_us,h1_read_headers_avg_us,h1_read_headers_max_seen_us,h1_exchange_avg_us,h1_exchange_max_seen_us\n' >"$CSV_TARGET"
 fi
 
 echo "h1_pool_scan preset=$PRESET requests=$REQUESTS concurrency=$CONCURRENCY delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL rounds=$ROUNDS"
@@ -120,8 +146,8 @@ if [[ -n "$CSV_FILE" ]]; then
   echo "csv_file=$CSV_FILE"
 fi
 echo
-echo "| round | max_conn | mode | wall_ms | p50/p95/p99_us | cpu_user/system_ms | rss_kb | peak_rss_kb | h1_created | h1_idle_hit |"
-echo "|---:|---:|---|---:|---|---|---:|---:|---:|---:|"
+echo "| round | max_conn | mode | wall_ms | p50/p95/p99_us | cpu_user/system_ms | rss_kb | peak_rss_kb | h1_created | h1_idle_hit | pool_wait avg/max | connect avg/max | acquire avg/max | write avg/max | read_headers avg/max | exchange avg/max |"
+echo "|---:|---:|---|---:|---|---|---:|---:|---:|---:|---|---|---|---|---|---|"
 
 for round in $(seq 1 "$ROUNDS"); do
   for max_conn in $MAX_CONN_CASES; do
@@ -174,6 +200,19 @@ for (max_conn, mode), rows in sorted(groups.items()):
         f"{median(rows, 'wall_ms')} | {percentile(rows, 'wall_ms', 0.95)} | "
         f"{median(rows, 'p95_us')} | {median(rows, 'p99_us')} | "
         f"{median(rows, 'rss_kb')} | {median(rows, 'h1_created')} |"
+    )
+print()
+print("| max_conn | mode | pool_wait_avg_us | connect_avg_us | acquire_avg_us | write_avg_us | read_headers_avg_us | exchange_avg_us |")
+print("|---:|---|---:|---:|---:|---:|---:|---:|")
+for (max_conn, mode), rows in sorted(groups.items()):
+    print(
+        f"| {max_conn} | {mode} | "
+        f"{median(rows, 'h1_pool_wait_avg_us')} | "
+        f"{median(rows, 'h1_connect_avg_us')} | "
+        f"{median(rows, 'h1_acquire_avg_us')} | "
+        f"{median(rows, 'h1_write_avg_us')} | "
+        f"{median(rows, 'h1_read_headers_avg_us')} | "
+        f"{median(rows, 'h1_exchange_avg_us')} |"
     )
 PY
 fi

@@ -292,6 +292,16 @@ bool mixed_uses_alt(int id, bool shuffle) {
   return (x & 1U) != 0;
 }
 
+httpclient::AsioHttpClient::Stats::TimingStats diff_timing(
+    const httpclient::AsioHttpClient::Stats::TimingStats& after,
+    const httpclient::AsioHttpClient::Stats::TimingStats& before) {
+  return httpclient::AsioHttpClient::Stats::TimingStats{
+      after.count - before.count,
+      after.total_us - before.total_us,
+      after.max_us,
+  };
+}
+
 httpclient::AsioHttpClient::Stats diff_stats(const httpclient::AsioHttpClient::Stats& after,
                                              const httpclient::AsioHttpClient::Stats& before) {
   return httpclient::AsioHttpClient::Stats{
@@ -306,7 +316,18 @@ httpclient::AsioHttpClient::Stats diff_stats(const httpclient::AsioHttpClient::S
       after.h1_cancelled - before.h1_cancelled,
       after.h1_pool_wait_cancelled - before.h1_pool_wait_cancelled,
       after.h1_close_on_cancel - before.h1_close_on_cancel,
+      diff_timing(after.h1_pool_wait, before.h1_pool_wait),
+      diff_timing(after.h1_connect, before.h1_connect),
+      diff_timing(after.h1_acquire, before.h1_acquire),
+      diff_timing(after.h1_write, before.h1_write),
+      diff_timing(after.h1_read_headers, before.h1_read_headers),
+      diff_timing(after.h1_read_body, before.h1_read_body),
+      diff_timing(after.h1_exchange, before.h1_exchange),
   };
+}
+
+std::uint64_t avg_us(const httpclient::AsioHttpClient::Stats::TimingStats& stats) {
+  return stats.count == 0 ? 0 : stats.total_us / stats.count;
 }
 
 httpclient::HttpClient::Stats diff_stats(
@@ -661,6 +682,28 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
             << " h1_cancelled=" << stats.h1_pool.h1_cancelled
             << " h1_pool_wait_cancelled=" << stats.h1_pool.h1_pool_wait_cancelled
             << " h1_close_on_cancel=" << stats.h1_pool.h1_close_on_cancel
+            << " h1_pool_wait_count=" << stats.h1_pool.h1_pool_wait.count
+            << " h1_pool_wait_avg_us=" << avg_us(stats.h1_pool.h1_pool_wait)
+            << " h1_pool_wait_max_seen_us=" << stats.h1_pool.h1_pool_wait.max_us
+            << " h1_connect_count=" << stats.h1_pool.h1_connect.count
+            << " h1_connect_avg_us=" << avg_us(stats.h1_pool.h1_connect)
+            << " h1_connect_max_seen_us=" << stats.h1_pool.h1_connect.max_us
+            << " h1_acquire_count=" << stats.h1_pool.h1_acquire.count
+            << " h1_acquire_avg_us=" << avg_us(stats.h1_pool.h1_acquire)
+            << " h1_acquire_max_seen_us=" << stats.h1_pool.h1_acquire.max_us
+            << " h1_write_count=" << stats.h1_pool.h1_write.count
+            << " h1_write_avg_us=" << avg_us(stats.h1_pool.h1_write)
+            << " h1_write_max_seen_us=" << stats.h1_pool.h1_write.max_us
+            << " h1_read_headers_count=" << stats.h1_pool.h1_read_headers.count
+            << " h1_read_headers_avg_us=" << avg_us(stats.h1_pool.h1_read_headers)
+            << " h1_read_headers_max_seen_us="
+            << stats.h1_pool.h1_read_headers.max_us
+            << " h1_read_body_count=" << stats.h1_pool.h1_read_body.count
+            << " h1_read_body_avg_us=" << avg_us(stats.h1_pool.h1_read_body)
+            << " h1_read_body_max_seen_us=" << stats.h1_pool.h1_read_body.max_us
+            << " h1_exchange_count=" << stats.h1_pool.h1_exchange.count
+            << " h1_exchange_avg_us=" << avg_us(stats.h1_pool.h1_exchange)
+            << " h1_exchange_max_seen_us=" << stats.h1_pool.h1_exchange.max_us
             << " h2_streams_submitted=" << stats.h2_pool.streams_submitted
             << " h2_streams_completed=" << stats.h2_pool.streams_completed
             << " h2_streams_timed_out=" << stats.h2_pool.streams_timed_out
