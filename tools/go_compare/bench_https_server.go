@@ -24,10 +24,24 @@ func main() {
 	delayMs := getenvInt("DELAY_MS", 0)
 	responseBytes := getenvInt("RESPONSE_BYTES", 4)
 	http1Only := getenv("HTTP1_ONLY", "") == "1"
+	certFile := getenv("CERT_FILE", "")
+	keyFile := getenv("KEY_FILE", "")
 
-	cert, err := generateSelfSignedCert()
-	if err != nil {
-		log.Fatal(err)
+	var cert tls.Certificate
+	var err error
+	if certFile != "" || keyFile != "" {
+		if certFile == "" || keyFile == "" {
+			log.Fatal("CERT_FILE and KEY_FILE must be set together")
+		}
+		cert, err = tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		cert, err = generateSelfSignedCert()
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	mux := http.NewServeMux()
