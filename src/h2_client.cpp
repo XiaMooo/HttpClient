@@ -180,7 +180,9 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
         strand_(asio::make_strand(io)),
         ssl_ctx_(ssl::context::tls_client),
         deadline_timer_(strand_),
-        options_(options) {}
+        options_(options) {
+    stream_limit_snapshot_.store(stream_limit(), std::memory_order_relaxed);
+  }
 
   ~Impl() {
     shutdown_now();
@@ -284,6 +286,11 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     StreamState state;
   };
 
+  struct StreamIndexEntry {
+    int32_t stream_id = 0;
+    std::size_t index = 0;
+  };
+
   struct DeadlineEntry {
     std::chrono::steady_clock::time_point deadline{};
     int32_t stream_id = 0;
@@ -327,6 +334,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     ~ConnectingGuard() {
       if (armed) {
         self.connecting_ = false;
+        self.connecting_snapshot_.store(false, std::memory_order_relaxed);
         self.notify_connect_waiters();
       }
     }
@@ -392,6 +400,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       connect_error_.clear();
       ++io_generation_;
       connecting_ = true;
+      connecting_snapshot_.store(true, std::memory_order_relaxed);
       ConnectingGuard guard{*this};
       insecure_ = insecure;
       if (!callbacks_) {
@@ -404,7 +413,8 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       if (!session_) {
         nghttp2_session_client_new(&session_, callbacks_, this);
         const auto stream_capacity =
-            std::max<std::size_t>(256, options_.max_concurrent_streams * 2);
+            std::max<std::size_t>(32, options_.max_concurrent_streams +
+                                          options_.max_concurrent_streams / 4 + 16);
         streams_.reserve(stream_capacity);
         free_stream_indices_.reserve(stream_capacity);
         stream_index_.reserve(stream_capacity);
@@ -491,6 +501,8 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       pump_output();
       connected_ = true;
       connecting_ = false;
+      connected_snapshot_.store(true, std::memory_order_relaxed);
+      connecting_snapshot_.store(false, std::memory_order_relaxed);
       guard.dismiss();
       notify_connect_waiters();
 
@@ -507,6 +519,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       connect_error_ = e.what();
       close_connection(connect_error_);
       connecting_ = false;
+      connecting_snapshot_.store(false, std::memory_order_relaxed);
       if (connect_error_ == "Operation canceled" ||
           connect_error_ == "operation_aborted") {
         ++stats_.connect_wait_cancelled;
@@ -724,9 +737,11 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     if (stream_id != expected_stream_id) {
       auto* entry = find_stream_entry(expected_stream_id);
       if (entry != nullptr) {
-        stream_index_.erase(expected_stream_id);
+        erase_stream_index(expected_stream_id);
         entry->id = stream_id;
-        stream_index_[stream_id] = static_cast<std::size_t>(entry - streams_.data());
+        stream_index_.push_back(
+            StreamIndexEntry{stream_id,
+                             static_cast<std::size_t>(entry - streams_.data())});
         state = &entry->state;
       } else {
         state = &acquire_stream_entry(stream_id).state;
@@ -809,6 +824,25 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     return std::min(configured, peer);
   }
 
+  std::size_t available_stream_slots_snapshot() const {
+    if (!connected_snapshot_.load(std::memory_order_relaxed) ||
+        stopping_snapshot_.load(std::memory_order_relaxed)) {
+      return 0;
+    }
+    auto limit = stream_limit_snapshot_.load(std::memory_order_relaxed);
+    auto active = active_streams_snapshot_.load(std::memory_order_relaxed);
+    return limit > active ? limit - active : 0;
+  }
+
+  bool connected_snapshot() const {
+    return connected_snapshot_.load(std::memory_order_relaxed) &&
+           !stopping_snapshot_.load(std::memory_order_relaxed);
+  }
+
+  bool connecting_snapshot() const {
+    return connecting_snapshot_.load(std::memory_order_relaxed);
+  }
+
   asio::awaitable<StreamSlot> acquire_stream_slot(
       std::chrono::milliseconds pool_timeout) {
     const auto deadline = std::chrono::steady_clock::now() + pool_timeout;
@@ -818,6 +852,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       }
       if (active_streams_ < stream_limit()) {
         ++active_streams_;
+        active_streams_snapshot_.store(active_streams_, std::memory_order_relaxed);
         update_max(stats_.max_active_streams, active_streams_);
         co_return StreamSlot{this, true};
       }
@@ -848,6 +883,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     if (active_streams_ > 0) {
       --active_streams_;
     }
+    active_streams_snapshot_.store(active_streams_, std::memory_order_relaxed);
     wake_stream_waiters();
   }
 
@@ -1158,6 +1194,8 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
         if (setting.settings_id == NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS) {
           self->peer_max_concurrent_streams_ =
               std::max<std::size_t>(1, setting.value);
+          self->stream_limit_snapshot_.store(self->stream_limit(),
+                                             std::memory_order_relaxed);
           self->wake_stream_waiters();
         }
       }
@@ -1206,14 +1244,18 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       return;
     }
     stopping_ = true;
+    stopping_snapshot_.store(true, std::memory_order_relaxed);
     close_active_stream();
     active_write_buffer_.clear();
     pending_write_buffer_.clear();
     writing_ = false;
     connected_ = false;
     connecting_ = false;
+    connected_snapshot_.store(false, std::memory_order_relaxed);
+    connecting_snapshot_.store(false, std::memory_order_relaxed);
     goaway_received_ = false;
     active_streams_ = 0;
+    active_streams_snapshot_.store(0, std::memory_order_relaxed);
     deadline_heap_.clear();
     deadline_timer_.cancel();
     deadline_timer_armed_ = false;
@@ -1236,8 +1278,11 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     writing_ = false;
     connected_ = false;
     connecting_ = false;
+    connected_snapshot_.store(false, std::memory_order_relaxed);
+    connecting_snapshot_.store(false, std::memory_order_relaxed);
     goaway_received_ = false;
     active_streams_ = 0;
+    active_streams_snapshot_.store(0, std::memory_order_relaxed);
     deadline_heap_.clear();
     deadline_timer_.cancel();
     deadline_timer_armed_ = false;
@@ -1248,6 +1293,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       session_ = nullptr;
     }
     peer_max_concurrent_streams_ = 100;
+    stream_limit_snapshot_.store(stream_limit(), std::memory_order_relaxed);
   }
 
   bool has_active_stream() const {
@@ -1368,16 +1414,22 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   }
 
   StreamEntry* find_stream_entry(int32_t stream_id) {
-    auto index = stream_index_.find(stream_id);
-    if (index == stream_index_.end() || index->second >= streams_.size()) {
-      return nullptr;
+    for (auto it = stream_index_.begin(); it != stream_index_.end(); ++it) {
+      if (it->stream_id != stream_id) {
+        continue;
+      }
+      if (it->index >= streams_.size()) {
+        stream_index_.erase(it);
+        return nullptr;
+      }
+      auto& entry = streams_[it->index];
+      if (!entry.in_use || entry.id != stream_id) {
+        stream_index_.erase(it);
+        return nullptr;
+      }
+      return &entry;
     }
-    auto& entry = streams_[index->second];
-    if (!entry.in_use || entry.id != stream_id) {
-      stream_index_.erase(index);
-      return nullptr;
-    }
-    return &entry;
+    return nullptr;
   }
 
   StreamState* find_stream(int32_t stream_id) {
@@ -1401,23 +1453,34 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
         entry.id = stream_id;
         entry.in_use = true;
         entry.state.reset_for_reuse();
-        stream_index_[stream_id] = index;
+        stream_index_.push_back(StreamIndexEntry{stream_id, index});
         return entry;
       }
     }
     streams_.push_back(StreamEntry{stream_id, true, StreamState{}});
-    stream_index_[stream_id] = streams_.size() - 1;
+    stream_index_.push_back(StreamIndexEntry{stream_id, streams_.size() - 1});
     return streams_.back();
   }
 
   void release_stream_entry(int32_t stream_id) {
     auto* entry = find_stream_entry(stream_id);
     if (entry != nullptr) {
-      stream_index_.erase(stream_id);
+      erase_stream_index(stream_id);
       entry->state.reset_for_reuse();
       entry->id = 0;
       entry->in_use = false;
       free_stream_indices_.push_back(static_cast<std::size_t>(entry - streams_.data()));
+    }
+  }
+
+  void erase_stream_index(int32_t stream_id) {
+    auto it = std::find_if(stream_index_.begin(), stream_index_.end(),
+                           [&](const StreamIndexEntry& entry) {
+                             return entry.stream_id == stream_id;
+                           });
+    if (it != stream_index_.end()) {
+      *it = stream_index_.back();
+      stream_index_.pop_back();
     }
   }
 
@@ -1435,6 +1498,11 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   bool connected_ = false;
   bool connecting_ = false;
   bool stopping_ = false;
+  std::atomic<bool> connected_snapshot_{false};
+  std::atomic<bool> connecting_snapshot_{false};
+  std::atomic<bool> stopping_snapshot_{false};
+  std::atomic<std::size_t> active_streams_snapshot_{0};
+  std::atomic<std::size_t> stream_limit_snapshot_{100};
   std::uint64_t io_generation_ = 0;
   std::unique_ptr<Stream> stream_;
   std::unique_ptr<NestedStream> nested_stream_;
@@ -1445,7 +1513,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   nghttp2_session* session_ = nullptr;
   std::vector<StreamEntry> streams_;
   std::vector<std::size_t> free_stream_indices_;
-  std::unordered_map<int32_t, std::size_t> stream_index_;
+  std::vector<StreamIndexEntry> stream_index_;
   std::unordered_map<int32_t, WaiterPtr> state_waiters_;
   std::vector<DeadlineEntry> deadline_heap_;
   std::vector<uint8_t> active_write_buffer_;
@@ -1535,9 +1603,9 @@ H2Client::ActiveImplDecision H2Client::active_impl_count(
   auto current = group.active_impls.load(std::memory_order_relaxed);
   auto previous = current;
   auto target = current;
-  if (inflight >= 384) {
+  if (inflight >= 256) {
     target = std::min<std::size_t>(group.impls.size(), 4);
-  } else if (inflight >= 192) {
+  } else if (inflight >= 128) {
     target = std::min<std::size_t>(group.impls.size(), 3);
   } else if (inflight >= 64) {
     target = std::min<std::size_t>(group.impls.size(), 2);
@@ -1547,13 +1615,16 @@ H2Client::ActiveImplDecision H2Client::active_impl_count(
     return ActiveImplDecision{active, active};
   }
   auto now = std::chrono::steady_clock::now();
+  const bool urgent_scale_up = inflight >= 128;
   std::lock_guard<std::mutex> lock(groups_mu_);
   current = group.active_impls.load(std::memory_order_relaxed);
   previous = current;
   if (target > current &&
-      now - group.last_scale_up >= options_.auto_scale_up_interval) {
-    group.active_impls.store(std::min<std::size_t>(target, current + 1),
-                             std::memory_order_relaxed);
+      (urgent_scale_up ||
+       now - group.last_scale_up >= options_.auto_scale_up_interval)) {
+    auto next = urgent_scale_up ? target
+                                : std::min<std::size_t>(target, current + 1);
+    group.active_impls.store(next, std::memory_order_relaxed);
     group.last_scale_up = now;
     group.last_busy = now;
   }
@@ -1576,6 +1647,52 @@ void H2Client::prewarm_active_impls(const std::shared_ptr<SessionGroup>& group,
       group->impls[i]->preconnect(request, insecure);
     }
   }
+}
+
+std::size_t H2Client::choose_impl_index(SessionGroup& group,
+                                        std::size_t active) const {
+  active = std::max<std::size_t>(
+      1, std::min<std::size_t>(active, group.impls.size()));
+  auto start = group.next.fetch_add(1, std::memory_order_relaxed) % active;
+
+  std::size_t best = active;
+  std::size_t best_slots = 0;
+  for (std::size_t offset = 0; offset < active; ++offset) {
+    auto idx = (start + offset) % active;
+    auto& impl = group.impls[idx];
+    if (!impl) {
+      continue;
+    }
+    auto slots = impl->available_stream_slots_snapshot();
+    if (slots > best_slots) {
+      best = idx;
+      best_slots = slots;
+      if (slots >= options_.max_concurrent_streams / 2) {
+        break;
+      }
+    }
+  }
+  if (best < active) {
+    return best;
+  }
+
+  for (std::size_t offset = 0; offset < active; ++offset) {
+    auto idx = (start + offset) % active;
+    auto& impl = group.impls[idx];
+    if (impl && impl->connecting_snapshot()) {
+      return idx;
+    }
+  }
+
+  for (std::size_t offset = 0; offset < active; ++offset) {
+    auto idx = (start + offset) % active;
+    auto& impl = group.impls[idx];
+    if (impl && impl->connected_snapshot()) {
+      return idx;
+    }
+  }
+
+  return start;
 }
 
 void H2Client::schedule_maintenance() {
@@ -1773,7 +1890,7 @@ asio::awaitable<Response> H2Client::async_request(Request request, bool insecure
   auto decision = active_impl_count(*group, inflight);
   prewarm_active_impls(group, request, insecure, decision.previous,
                        decision.active);
-  auto idx = group->next.fetch_add(1, std::memory_order_relaxed) % decision.active;
+  auto idx = choose_impl_index(*group, decision.active);
   try {
     auto response =
         co_await group->impls[idx]->async_request(std::move(request), insecure);
@@ -1792,7 +1909,7 @@ void H2Client::async_request_callback(Request request, ResponseHandler handler,
   auto decision = active_impl_count(*group, inflight);
   prewarm_active_impls(group, request, insecure, decision.previous,
                        decision.active);
-  auto idx = group->next.fetch_add(1, std::memory_order_relaxed) % decision.active;
+  auto idx = choose_impl_index(*group, decision.active);
   group->impls[idx]->async_request_callback(
       std::move(request),
       [group = std::move(group), handler = std::move(handler)](Response response) mutable {

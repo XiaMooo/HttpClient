@@ -83,6 +83,7 @@ private:
   struct ActiveImplDecision;
   ActiveImplDecision active_impl_count(SessionGroup& group,
                                        std::size_t inflight) const;
+  std::size_t choose_impl_index(SessionGroup& group, std::size_t active) const;
   void prewarm_active_impls(const std::shared_ptr<SessionGroup>& group,
                             const Request& request, bool insecure,
                             std::size_t previous_active,

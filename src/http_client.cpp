@@ -744,7 +744,7 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
           options.h1.shard_count = std::min<std::size_t>(16, hw);
         }
         options.h1.max_connections_per_origin =
-            std::min<std::size_t>(options.h1.max_connections_per_origin, 64);
+            std::min<std::size_t>(options.h1.max_connections_per_origin, 32);
         options.h2.auto_shards = true;
         if (options.h2.shard_count == 0) {
           options.h2.shard_count = std::min<std::size_t>(4, hw);

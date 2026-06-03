@@ -24,7 +24,7 @@
 |---|---:|---|
 | `h1.shard_count` | `0` | H1 shard 数。`0` 表示自动选择，当前最多 4 个 shard。 |
 | `h1.auto_shards` | `false` | 由 `RuntimeProfile::Auto` 设置。开启后同 origin 初始只使用少量 shard，并按 in-flight 压力逐步扩大活跃 shard 窗口。 |
-| `h1.max_connections_per_origin` | `128` | 每个 H1 origin 的最大连接数。没有 idle 且达到上限时，请求等待连接归还；idle 连接归还时固定优先唤醒已等待请求，避免新请求插队造成 p99 饥饿。 |
+| `h1.max_connections_per_origin` | `128` | 每个 H1 origin 的最大连接数。Auto profile 会把默认有效上限收窄到 32，降低 TLS connection 和内存压力；Throughput profile 会放大该值以追求极限吞吐。没有 idle 且达到上限时，请求等待连接归还；idle 连接归还时固定优先唤醒已等待请求，避免新请求插队造成 p99 饥饿。 |
 | `h1.max_origins_per_shard` | `4096` | 每个 H1 shard 的 origin pool LRU 容量。`0` 表示不按容量驱逐。 |
 | `h1.origin_idle_ttl` | `300s` | H1 origin pool 空闲 TTL。只在新 origin 创建时触发懒驱逐。`0s` 表示不按 TTL 过期。 |
 | `h1.maintenance_interval` | `10s` | H1 shard 级后台维护周期。清理过期 idle origin，并在 Auto 低负载持续一段时间后收窄 active shard 窗口。`0s` 表示关闭。 |
@@ -41,10 +41,9 @@ H1 pool 的连接归还固定采用 FIFO-fair idle reservation：如果已有请
 这个行为不提供配置开关，因为它是防止少量请求被饿到整轮末尾的尾延迟稳定性语义。
 
 高并发单 H1 origin 下，`max_connections_per_origin` 不应盲目调大。当前本地 TLS bench
-显示：默认 128 条连接能稳定 p99；256/512 条连接只有在池已经预热到对应规模时才改善
-wall time 和 p95/p99。若正式流量阶段才补建大量 TLS connection，handshake 和调度压力会
-反而拉坏 p95/p99。调参建议使用 `scripts/run_h1_pool_scan.sh` 同时观察 `h1_conn_created`：
-热路径里该值应接近 0。
+显示：Auto 有效上限 32 在 100k/1M mixed 场景下比 64 更低 RSS、更少 TLS connection，
+且吞吐和 p99 没有退化。256/512 这类大连接数只适合作为 Throughput 压测选项。调参建议
+使用 `scripts/run_h1_pool_scan.sh` 同时观察 `h1_conn_created`：热路径里该值应接近 0。
 
 ## H2 Session
 
@@ -57,7 +56,7 @@ wall time 和 p95/p99。若正式流量阶段才补建大量 TLS connection，ha
 | `h2.session_group_idle_ttl` | `300s` | H2 session group 空闲 TTL。 |
 | `h2.maintenance_interval` | `10s` | H2 后台维护周期。只在 H2 owned shard 存在时启用，不占用调用方外部 `io_context`。 |
 | `h2.auto_scale_down_idle_ttl` | `60s` | Auto H2 持续低负载多久后允许逐级减少 active session。 |
-| `h2.auto_scale_up_interval` | `25ms` | Auto H2 升档最小间隔，避免突发流量一次性建立多个 H2/TLS connection。 |
+| `h2.auto_scale_up_interval` | `25ms` | Auto H2 中低压力升档最小间隔，避免短突发一次性建立多个 H2/TLS connection；高压力阈值下会直接升到目标 active session 数，减少 measured 阶段的 stream slot 等待。 |
 | `h2.verify_tls` | `true` | H2 TLS 校验开关。 |
 
 ## Recommended Presets
@@ -97,7 +96,7 @@ options.h2_failure_ttl = std::chrono::seconds(30);
 options.origin_waiter_limit = 64;
 options.detection_overflow_policy =
     httpclient::HttpClient::DetectionOverflowPolicy::FallbackH1;
-options.h1.max_connections_per_origin = 128;
+options.h1.max_connections_per_origin = 32;
 options.h2.sessions_per_origin = 1;
 ```
 
