@@ -47,6 +47,38 @@ struct LatencyStats {
   std::uint64_t p50_us = 0;
   std::uint64_t p95_us = 0;
   std::uint64_t p99_us = 0;
+  std::size_t samples = 0;
+};
+
+struct LatencyRecorder {
+  static constexpr std::size_t kMaxSamples = 200000;
+
+  explicit LatencyRecorder(int requests) {
+    auto total = static_cast<std::size_t>(std::max(0, requests));
+    stride = total <= kMaxSamples
+                 ? std::size_t{1}
+                 : (total + kMaxSamples - 1) / kMaxSamples;
+    auto sample_count = stride == 0 ? std::size_t{0}
+                                    : (total + stride - 1) / stride;
+    samples.resize(sample_count);
+  }
+
+  void record(int id, std::uint64_t latency_us) {
+    if (id < 0 || stride == 0) {
+      return;
+    }
+    auto index = static_cast<std::size_t>(id);
+    if (index % stride != 0) {
+      return;
+    }
+    auto sample_index = index / stride;
+    if (sample_index < samples.size()) {
+      samples[sample_index] = latency_us;
+    }
+  }
+
+  std::vector<std::uint64_t> samples;
+  std::size_t stride = 1;
 };
 
 ProcessCpuStats read_process_cpu_stats() {
@@ -70,7 +102,13 @@ LatencyStats summarize_latencies(std::vector<std::uint64_t>& latencies_us) {
   if (latencies_us.empty()) {
     return stats;
   }
+  latencies_us.erase(std::remove(latencies_us.begin(), latencies_us.end(), 0),
+                     latencies_us.end());
+  if (latencies_us.empty()) {
+    return stats;
+  }
   std::sort(latencies_us.begin(), latencies_us.end());
+  stats.samples = latencies_us.size();
   auto percentile = [&](double p) {
     auto index = static_cast<std::size_t>(
         std::ceil(p * static_cast<double>(latencies_us.size())) - 1.0);
@@ -339,8 +377,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   };
 
   auto state = std::make_shared<State>();
-  auto latencies_us = std::make_shared<std::vector<std::uint64_t>>();
-  latencies_us->resize(static_cast<std::size_t>(std::max(0, args.requests)));
+  auto latencies = std::make_shared<LatencyRecorder>(args.requests);
   auto payload = std::make_shared<std::string>(
       static_cast<std::size_t>(std::max(0, args.body_bytes)), 'x');
   auto ex = co_await asio::this_coro::executor;
@@ -436,11 +473,11 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
                                                     httpclient::Response resp,
                                                     std::chrono::steady_clock::time_point started) {
     if (id >= 0 && id < args.requests) {
-      (*latencies_us)[static_cast<std::size_t>(id)] =
-          static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - started)
-                  .count());
+      latencies->record(
+          id, static_cast<std::uint64_t>(
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - started)
+                      .count()));
     }
     if (resp.http_version == 1) {
       state->h1.fetch_add(1);
@@ -471,11 +508,11 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   auto handle_response_no_timer = [&, state](int id, httpclient::Response resp,
                                              std::chrono::steady_clock::time_point started) {
     if (id >= 0 && id < args.requests) {
-      (*latencies_us)[static_cast<std::size_t>(id)] =
-          static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - started)
-                  .count());
+      latencies->record(
+          id, static_cast<std::uint64_t>(
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - started)
+                      .count()));
     }
     if (resp.http_version == 1) {
       state->h1.fetch_add(1);
@@ -531,9 +568,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
           co_return GatherResult{std::move(resp), latency_us};
         },
         [&](std::size_t id, GatherResult result) {
-          if (id < latencies_us->size()) {
-            (*latencies_us)[id] = result.latency_us;
-          }
+          latencies->record(static_cast<int>(id), result.latency_us);
           handle_response_no_latency(std::move(result.response));
         });
   } else if (!args.awaitable_mode) {
@@ -571,11 +606,11 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
                 : args.url);
         auto request_start = std::chrono::steady_clock::now();
         auto resp = co_await client.async_request(std::move(req));
-        (*latencies_us)[static_cast<std::size_t>(id)] =
-            static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - request_start)
-                    .count());
+        latencies->record(
+            id, static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - request_start)
+                        .count()));
         if (resp.http_version == 1) {
           state->h1.fetch_add(1);
         } else if (resp.http_version == 3) {
@@ -611,7 +646,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
                      .count();
   auto cpu_after = read_process_cpu_stats();
   auto mem = read_process_memory_stats();
-  auto latency = summarize_latencies(*latencies_us);
+  auto latency = summarize_latencies(latencies->samples);
   const auto cpu_user_ms = (cpu_after.user_us - cpu_before.user_us) / 1000;
   const auto cpu_system_ms =
       (cpu_after.system_us - cpu_before.system_us) / 1000;
@@ -621,6 +656,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   std::cout << "wall_ms=" << wall_ms << "\n";
   std::cout << "p50_us=" << latency.p50_us << " p95_us=" << latency.p95_us
             << " p99_us=" << latency.p99_us
+            << " latency_samples=" << latency.samples
             << " cpu_user_ms=" << cpu_user_ms
             << " cpu_system_ms=" << cpu_system_ms << "\n";
   std::cout << "rss_kb=" << mem.rss_kb << " peak_rss_kb=" << mem.peak_rss_kb
