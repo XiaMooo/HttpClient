@@ -176,6 +176,7 @@ struct Args {
   int preconnect_per_url = 0;
   int max_retries = 0;
   int timeout_ms = 5000;
+  int smooth_start_ms = 0;
   bool reset_connections_after_warmup = false;
   bool concurrent_warmup = false;
   bool sequential_warmup = false;
@@ -245,6 +246,8 @@ Args parse_args(int argc, char** argv) {
       args.max_retries = std::atoi(argv[++i]);
     } else if (next("--timeout-ms")) {
       args.timeout_ms = std::atoi(argv[++i]);
+    } else if (next("--smooth-start-ms")) {
+      args.smooth_start_ms = std::atoi(argv[++i]);
     } else if (s == "--reset-connections-after-warmup") {
       args.reset_connections_after_warmup = true;
     } else if (s == "--concurrent-warmup") {
@@ -448,7 +451,11 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     return req;
   };
 
-  if (args.warmup_per_url > 0 && args.concurrent_warmup) {
+  const bool use_concurrent_warmup =
+      args.warmup_per_url > 0 &&
+      (args.concurrent_warmup || !args.sequential_warmup);
+
+  if (use_concurrent_warmup) {
     auto total = static_cast<std::size_t>(
         args.warmup_per_url * static_cast<int>(urls.size()));
     auto warmup_concurrency =
@@ -474,8 +481,6 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
         }
       }
     }
-  } else if (args.warmup_per_url > 0) {
-    std::cerr << "warmup_skipped=sequential_warmup_disabled\n";
   }
 
   if (args.reset_connections_after_warmup) {
@@ -532,6 +537,20 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     return req;
   };
 
+  auto smooth_start_delay = [&](int slot, int slots) -> asio::awaitable<void> {
+    if (args.smooth_start_ms <= 0 || slots <= 1) {
+      co_return;
+    }
+    auto delay_ms = (slot * args.smooth_start_ms) / slots;
+    if (delay_ms <= 0) {
+      co_return;
+    }
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    timer.expires_after(std::chrono::milliseconds(delay_ms));
+    boost::system::error_code ec;
+    co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+  };
+
   auto handle_response_no_timer = [&, state](int id, httpclient::Response resp,
                                              std::chrono::steady_clock::time_point started) {
     if (id >= 0 && id < args.requests) {
@@ -585,6 +604,19 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
         static_cast<std::size_t>(args.requests),
         static_cast<std::size_t>(args.concurrency),
         [&](std::size_t id) -> asio::awaitable<GatherResult> {
+          if (args.smooth_start_ms > 0 && args.concurrency > 0) {
+            auto delay_ms =
+                (static_cast<int>(id % static_cast<std::size_t>(args.concurrency)) *
+                 args.smooth_start_ms) /
+                std::max(1, args.concurrency);
+            if (delay_ms > 0) {
+              asio::steady_timer timer(co_await asio::this_coro::executor);
+              timer.expires_after(std::chrono::milliseconds(delay_ms));
+              boost::system::error_code ec;
+              co_await timer.async_wait(
+                  asio::redirect_error(asio::use_awaitable, ec));
+            }
+          }
           auto request_start = std::chrono::steady_clock::now();
           auto resp =
               co_await client.async_request(make_indexed_request(static_cast<int>(id)));
@@ -621,10 +653,20 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
 
     auto starters = std::min(args.concurrency, args.requests);
     for (int i = 0; i < starters; ++i) {
-      (*callback_issue_one)();
+      asio::co_spawn(
+          ex,
+          [smooth_start_delay, callback_issue_one, i, starters]()
+              -> asio::awaitable<void> {
+            co_await smooth_start_delay(i, starters);
+            (*callback_issue_one)();
+            co_return;
+          },
+          asio::detached);
     }
   } else {
-    auto issue_loop = [&, state, payload, done_timer]() -> asio::awaitable<void> {
+    auto issue_loop = [&, state, payload, done_timer,
+                       smooth_start_delay](int slot, int slots) -> asio::awaitable<void> {
+      co_await smooth_start_delay(slot, slots);
       for (int id = state->issued.fetch_add(1); id < args.requests;
            id = state->issued.fetch_add(1)) {
         httpclient::Request req = make_request(
@@ -659,7 +701,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
 
     auto starters = std::min(args.concurrency, args.requests);
     for (int i = 0; i < starters; ++i) {
-      asio::co_spawn(ex, issue_loop(), asio::detached);
+      asio::co_spawn(ex, issue_loop(i, starters), asio::detached);
     }
   }
 

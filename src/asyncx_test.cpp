@@ -22,6 +22,12 @@ using namespace std::chrono_literals;
 
 namespace {
 
+void trace_step(const char* name) {
+  if (std::getenv("ASYNCX_TEST_TRACE")) {
+    std::cerr << "[asyncx_test] " << name << "\n";
+  }
+}
+
 asio::awaitable<int> value_after(int value, std::chrono::milliseconds delay) {
   co_await asyncx::sleep(delay);
   co_return value;
@@ -58,6 +64,7 @@ struct ThrowJob {
 };
 
 asio::awaitable<void> run_tests() {
+  trace_step("gather");
   auto [a, b, c] = co_await asyncx::gather(value_after(1, 1ms),
                                            value_after(2, 1ms),
                                            value_after(3, 1ms));
@@ -77,6 +84,7 @@ asio::awaitable<void> run_tests() {
   }
   asyncx::assert_same_executor(direct_task, direct_task);
 
+  trace_step("debug exception handler");
   bool exception_handler_called = false;
   asyncx::set_exception_handler([&](std::exception_ptr) {
     exception_handler_called = true;
@@ -95,6 +103,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("gather_limited");
   auto limited = co_await asyncx::gather_limited(
       8, 3, [](std::size_t i) { return value_after(static_cast<int>(i), 1ms); });
   if (limited.size() != 8 || limited[0] != 0 || limited[7] != 7) {
@@ -128,6 +137,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("for_each_limited");
   std::atomic<int> for_each_sum{0};
   co_await asyncx::for_each_limited(
       16, 4,
@@ -155,6 +165,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("return_exceptions");
   auto [good, bad] = co_await asyncx::gather(
       asyncx::return_exceptions, value_after(1, 1ms),
       fail_after(1ms, "return exceptions boom"));
@@ -167,6 +178,7 @@ asio::awaitable<void> run_tests() {
   } catch (const std::runtime_error&) {
   }
 
+  trace_step("queue");
   asyncx::Queue<int> queue(1);
   co_await queue.put(31);
   if (queue.size() != 1 || queue.try_put(32)) {
@@ -178,6 +190,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("semaphore");
   asyncx::Semaphore sem(1);
   if (!sem.try_acquire() || sem.try_acquire()) {
     std::cerr << "semaphore try_acquire failed\n";
@@ -198,6 +211,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("lock");
   asyncx::Lock lock;
   {
     auto guard = co_await lock.acquire();
@@ -212,6 +226,7 @@ asio::awaitable<void> run_tests() {
   }
   lock.release();
 
+  trace_step("event");
   asyncx::Event event;
   auto event_task = co_await asyncx::create_task([&]() -> asio::awaitable<int> {
     co_await event.wait();
@@ -228,6 +243,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("wait/as_completed");
   std::vector<asyncx::Task<int>> waited_tasks;
   waited_tasks.push_back(co_await asyncx::create_task(value_after(61, 1ms)));
   waited_tasks.push_back(co_await asyncx::create_task(value_after(62, 20ms)));
@@ -243,6 +259,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("shield");
   auto shielded = co_await asyncx::create_task(value_after(71, 10ms));
   bool shield_timeout = false;
   try {
@@ -255,6 +272,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("task_group");
   auto group_ex = co_await asio::this_coro::executor;
   asyncx::TaskGroup group(group_ex);
   auto grouped = group.create_task(value_after(81, 1ms), "grouped");
@@ -264,6 +282,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("gather exception");
   bool gather_failed = false;
   try {
     (void)co_await asyncx::gather(value_after(1, 5ms),
@@ -277,6 +296,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("one_of value");
   auto [first, sleeper, later] =
       co_await asyncx::one_of(value_after(7, 1ms), asyncx::sleep(100),
                               value_after(8, 100ms));
@@ -286,6 +306,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("race value");
   auto [winner, loser] =
       co_await asyncx::race(value_after(9, 1ms), asyncx::sleep(100));
   if (!winner.has_value() || *winner != 9 || loser.has_value()) {
@@ -293,6 +314,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("wait_for timeout");
   bool timed_out = false;
   try {
     (void)co_await asyncx::wait_for(value_after(3, 50ms), 1);
@@ -304,12 +326,14 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("wait_for value");
   auto value = co_await asyncx::wait_for(value_after(4, 1ms), 100ms);
   if (value != 4) {
     std::cerr << "wait_for value failed\n";
     std::exit(1);
   }
 
+  trace_step("mixed task one_of");
   auto task = co_await asyncx::create_task(value_after(11, 20ms));
   auto [task_result, fast_result] =
       co_await asyncx::one_of(task, value_after(12, 1ms));
@@ -324,6 +348,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("mixed task race");
   auto slow_task = co_await asyncx::create_task(value_after(13, 100ms));
   auto [slow_result, quick_result] =
       co_await asyncx::race(slow_task, value_after(14, 1ms));
@@ -343,6 +368,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("run_in_pool");
   asyncx::ThreadPool pool(2);
   auto io_thread = std::this_thread::get_id();
   auto pool_thread = std::thread::id{};
@@ -379,6 +405,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("run_job_in_pool");
   auto sum = co_await asyncx::run_job_in_pool<AddJob>(pool, 20, 22);
   if (sum != 42) {
     std::cerr << "run_job_in_pool run() failed\n";
@@ -410,6 +437,7 @@ asio::awaitable<void> run_tests() {
     std::exit(1);
   }
 
+  trace_step("done");
   co_return;
 }
 

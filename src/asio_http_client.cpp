@@ -1,4 +1,5 @@
 #include "httpclient/asio_http_client.hpp"
+#include "asyncx/asyncx.hpp"
 #include "proxy_support.hpp"
 
 #include <boost/asio/as_tuple.hpp>
@@ -2193,54 +2194,93 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
           auto pool = self->get_origin_pool(*shard, url);
           const auto max_connections =
               std::max<std::size_t>(1, self->options_.max_connections_per_origin);
+          const auto max_connecting =
+              std::max<std::size_t>(1, self->options_.max_connecting_per_origin);
+          const auto worker_count =
+              std::max<std::size_t>(1, std::min(target_count, max_connecting));
           auto connect_timeout =
               effective_timeout(request, &Request::Timeout::connect_ms);
-          for (;;) {
-            const auto active = url.tls ? pool->active_tls : pool->active_plain;
-            const auto idle = url.tls ? pool->idle_tls.size() : pool->idle_plain.size();
-            if (idle >= target_count || active >= max_connections) {
-              break;
-            }
+          std::atomic<std::size_t> launched{0};
+          co_await asyncx::for_each_limited(
+              worker_count, worker_count,
+              [&](std::size_t) -> asio::awaitable<void> {
+                for (;;) {
+                  const auto active = url.tls ? pool->active_tls : pool->active_plain;
+                  const auto connecting =
+                      url.tls ? pool->connecting_tls : pool->connecting_plain;
+                  const auto idle =
+                      url.tls ? pool->idle_tls.size() : pool->idle_plain.size();
+                  if (idle >= target_count || active >= max_connections ||
+                      connecting >= max_connecting) {
+                    co_return;
+                  }
+                  auto index = launched.fetch_add(1, std::memory_order_relaxed);
+                  if (index >= target_count) {
+                    co_return;
+                  }
 
-            if (url.tls) {
-              ++pool->active_tls;
-            } else {
-              ++pool->active_plain;
-            }
-            try {
-              auto connect_started = std::chrono::steady_clock::now();
-              if (url.tls) {
-                auto conn =
-                    co_await self->open_tls_connection(pool, url, request,
-                                                       connect_timeout);
-                ++self->stats_.h1_conn_created;
-                self->record_timing(self->stats_.h1_connect,
-                                    self->elapsed_us(connect_started));
-                pool->idle_tls.push_back(std::move(conn));
-                ++self->stats_.h1_return_to_idle;
-              } else {
-                auto conn = co_await self->open_plain_connection(url, connect_timeout);
-                ++self->stats_.h1_conn_created;
-                self->record_timing(self->stats_.h1_connect,
-                                    self->elapsed_us(connect_started));
-                pool->idle_plain.push_back(std::move(conn));
-                ++self->stats_.h1_return_to_idle;
-              }
-            } catch (...) {
-              if (url.tls) {
-                if (pool->active_tls > 0) {
-                  --pool->active_tls;
+                  if (url.tls) {
+                    ++pool->active_tls;
+                    ++pool->connecting_tls;
+                  } else {
+                    ++pool->active_plain;
+                    ++pool->connecting_plain;
+                  }
+                  try {
+                    auto connect_started = std::chrono::steady_clock::now();
+                    if (url.tls) {
+                      auto conn =
+                          co_await self->open_tls_connection(pool, url, request,
+                                                             connect_timeout);
+                      if (pool->connecting_tls > 0) {
+                        --pool->connecting_tls;
+                      }
+                      ++self->stats_.h1_conn_created;
+                      self->record_timing(self->stats_.h1_connect,
+                                          self->elapsed_us(connect_started));
+                      pool->idle_tls.push_back(std::move(conn));
+                      ++self->stats_.h1_return_to_idle;
+                      if (self->wake_one_with_idle_reservation(pool->wait_tls)) {
+                        ++pool->reserved_idle_tls;
+                      }
+                    } else {
+                      auto conn =
+                          co_await self->open_plain_connection(url, connect_timeout);
+                      if (pool->connecting_plain > 0) {
+                        --pool->connecting_plain;
+                      }
+                      ++self->stats_.h1_conn_created;
+                      self->record_timing(self->stats_.h1_connect,
+                                          self->elapsed_us(connect_started));
+                      pool->idle_plain.push_back(std::move(conn));
+                      ++self->stats_.h1_return_to_idle;
+                      if (self->wake_one_with_idle_reservation(pool->wait_plain)) {
+                        ++pool->reserved_idle_plain;
+                      }
+                    }
+                  } catch (...) {
+                    if (url.tls) {
+                      if (pool->connecting_tls > 0) {
+                        --pool->connecting_tls;
+                      }
+                      if (pool->active_tls > 0) {
+                        --pool->active_tls;
+                      }
+                      self->wake_one(pool->wait_tls);
+                    } else {
+                      if (pool->connecting_plain > 0) {
+                        --pool->connecting_plain;
+                      }
+                      if (pool->active_plain > 0) {
+                        --pool->active_plain;
+                      }
+                      self->wake_one(pool->wait_plain);
+                    }
+                    co_return;
+                  }
                 }
-                self->wake_one(pool->wait_tls);
-              } else {
-                if (pool->active_plain > 0) {
-                  --pool->active_plain;
-                }
-                self->wake_one(pool->wait_plain);
-              }
-              throw;
-            }
-          }
+              },
+              [](std::size_t, std::monostate) {});
           co_return;
           },
           asio::use_awaitable);

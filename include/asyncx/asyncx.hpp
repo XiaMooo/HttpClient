@@ -1814,7 +1814,7 @@ auto run_in_pool(asio::thread_pool& pool, Fn fn)
   state->wake->expires_at(asio::steady_timer::time_point::max());
 
   auto work = std::make_shared<FnType>(std::move(fn));
-  asio::post(pool, [state, work] {
+  asio::post(pool, [state, work, ex] {
     std::optional<result_value_t<R>> value;
     std::exception_ptr error;
     try {
@@ -1834,7 +1834,9 @@ auto run_in_pool(asio::thread_pool& pool, Fn fn)
       state->error = std::move(error);
       state->done = true;
     }
-    state->wake->cancel();
+    asio::post(ex, [state] {
+      state->wake->expires_at(asio::steady_timer::clock_type::now());
+    });
   });
 
   bool ready = false;
