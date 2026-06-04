@@ -163,6 +163,7 @@ struct Response {
   double starttransfer_time_sec = 0.0;
   long num_connects = 0;
   long http_version = 0;
+  bool reused_connection = false;
   std::string primary_ip;
 
   std::optional<std::string_view> header(std::string_view name) const;

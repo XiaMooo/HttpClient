@@ -29,6 +29,7 @@ func main() {
 	var mixed bool
 	var mixedShuffle bool
 	var gather bool
+	var idempotencyKey bool
 	flag.StringVar(&url, "url", "http://127.0.0.1:8080/ping", "request url")
 	flag.IntVar(&concurrency, "concurrency", 4, "concurrency")
 	flag.IntVar(&requests, "requests", 16, "requests")
@@ -42,6 +43,7 @@ func main() {
 	flag.BoolVar(&mixed, "mixed", false, "alternate requests between url and url-alt")
 	flag.BoolVar(&mixedShuffle, "mixed-shuffle", false, "use a stable shuffled mixed request order")
 	flag.BoolVar(&gather, "gather", false, "run requests in fixed-size goroutine batches and gather results")
+	flag.BoolVar(&idempotencyKey, "idempotency-key", false, "send an Idempotency-Key header")
 	flag.Parse()
 
 	transport := &http.Transport{
@@ -86,6 +88,9 @@ func main() {
 			if err != nil {
 				continue
 			}
+			if idempotencyKey {
+				req.Header.Set("Idempotency-Key", "httpclient-bench")
+			}
 			resp, err := client.Do(req)
 			if err != nil {
 				continue
@@ -116,7 +121,7 @@ func main() {
 			for i := 0; i < n; i++ {
 				go func(slot int) {
 					defer wg.Done()
-					results[slot] = doRequest(client, makeTarget(url, urlAlt, mixed, mixedShuffle, base+slot), bodyBytes)
+				results[slot] = doRequest(client, makeTarget(url, urlAlt, mixed, mixedShuffle, base+slot), bodyBytes, idempotencyKey)
 				}(i)
 			}
 			wg.Wait()
@@ -135,7 +140,7 @@ func main() {
 			go func(id int) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				result := doRequest(client, makeTarget(url, urlAlt, mixed, mixedShuffle, id), bodyBytes)
+				result := doRequest(client, makeTarget(url, urlAlt, mixed, mixedShuffle, id), bodyBytes, idempotencyKey)
 				latencies[id] = result.latencyUs
 				addResultAtomic(&ok, &fail, &h1, &h2, result)
 			}(i)
@@ -180,7 +185,7 @@ func makeTarget(url string, urlAlt string, mixed bool, mixedShuffle bool, id int
 	return url
 }
 
-func doRequest(client *http.Client, targetURL string, bodyBytes int) requestResult {
+func doRequest(client *http.Client, targetURL string, bodyBytes int, idempotencyKey bool) requestResult {
 	start := time.Now()
 	method := http.MethodGet
 	var body io.Reader
@@ -191,6 +196,9 @@ func doRequest(client *http.Client, targetURL string, bodyBytes int) requestResu
 	req, err := http.NewRequest(method, targetURL, body)
 	if err != nil {
 		return requestResult{latencyUs: uint64(time.Since(start).Microseconds())}
+	}
+	if idempotencyKey {
+		req.Header.Set("Idempotency-Key", "httpclient-bench")
 	}
 	resp, err := client.Do(req)
 	if err != nil {

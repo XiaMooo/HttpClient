@@ -278,10 +278,19 @@ bool is_retry_status(long status, const std::vector<int>& statuses) {
          statuses.end();
 }
 
-bool is_retriable_method(std::string_view method) {
+bool is_go_replayable_method(std::string_view method) {
   auto lower = lower_copy(method);
   return lower == "get" || lower == "head" || lower == "options" ||
-         lower == "delete" || lower == "put";
+         lower == "trace";
+}
+
+bool has_idempotency_key(const Request& request) {
+  return request.header("Idempotency-Key").has_value() ||
+         request.header("X-Idempotency-Key").has_value();
+}
+
+bool is_replayable_request(const Request& request) {
+  return is_go_replayable_method(request.method) || has_idempotency_key(request);
 }
 
 bool is_retriable_transport_error(std::string_view error) {
@@ -289,8 +298,7 @@ bool is_retriable_transport_error(std::string_view error) {
          error.find("h1_read_body") != std::string_view::npos ||
          error.find("h1_write") != std::string_view::npos ||
          error.find("End of file") != std::string_view::npos ||
-         error.find("timeout") != std::string_view::npos ||
-         error.find("operation_aborted") != std::string_view::npos;
+         error.find("timeout") != std::string_view::npos;
 }
 
 std::string zlib_decode(std::string_view input, int window_bits) {
@@ -424,6 +432,8 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
     std::atomic<std::uint64_t> detect_queue_overflow{0};
     std::atomic<std::uint64_t> detect_overflow_to_h1{0};
     std::atomic<std::uint64_t> detect_overflow_to_h1_later_h2{0};
+    std::atomic<std::uint64_t> retry_status{0};
+    std::atomic<std::uint64_t> retry_transport{0};
   };
 
   struct OriginState {
@@ -915,12 +925,19 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
 
       const bool retry_status =
           last.error.empty() &&
+          is_replayable_request(request) &&
           is_retry_status(last.status, options_.retry_statuses);
       const bool retry_transport =
-          !last.error.empty() && is_retriable_method(request.method) &&
+          !last.error.empty() && last.reused_connection &&
+          is_replayable_request(request) &&
           is_retriable_transport_error(last.error);
       if (attempt >= max_retries || (!retry_status && !retry_transport)) {
         co_return last;
+      }
+      if (retry_status) {
+        stats_.retry_status.fetch_add(1, std::memory_order_relaxed);
+      } else if (retry_transport) {
+        stats_.retry_transport.fetch_add(1, std::memory_order_relaxed);
       }
       if (retry_backoff.count() > 0) {
         asio::steady_timer timer(co_await asio::this_coro::executor);
@@ -1461,6 +1478,8 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
         stats_.detect_queue_overflow.load(),
         stats_.detect_overflow_to_h1.load(),
         stats_.detect_overflow_to_h1_later_h2.load(),
+        stats_.retry_status.load(),
+        stats_.retry_transport.load(),
         h1_.stats(),
         h2_.stats(),
     };
@@ -1480,6 +1499,8 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
     stats_.detect_queue_overflow.store(0, std::memory_order_relaxed);
     stats_.detect_overflow_to_h1.store(0, std::memory_order_relaxed);
     stats_.detect_overflow_to_h1_later_h2.store(0, std::memory_order_relaxed);
+    stats_.retry_status.store(0, std::memory_order_relaxed);
+    stats_.retry_transport.store(0, std::memory_order_relaxed);
     h1_.reset_stats();
     h2_.reset_stats();
   }

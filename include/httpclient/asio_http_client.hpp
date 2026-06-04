@@ -62,6 +62,7 @@ public:
     std::size_t shard_count = 0;
     bool auto_shards = false;
     std::size_t max_connections_per_origin = 128;
+    std::size_t max_connecting_per_origin = 128;
     std::size_t max_origins_per_shard = 4096;
     std::chrono::seconds origin_idle_ttl{300};
     std::chrono::seconds maintenance_interval{10};

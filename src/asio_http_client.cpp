@@ -633,6 +633,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     std::size_t next_h1_tls_actor = 0;
     std::size_t active_plain = 0;
     std::size_t active_tls = 0;
+    std::size_t connecting_plain = 0;
+    std::size_t connecting_tls = 0;
     // Returned idle connections are reserved for the waiter we wake. This keeps
     // hot H1 pools FIFO-fair and prevents new arrivals from repeatedly stealing
     // the just-returned connection before the waiter resumes on the shard.
@@ -810,6 +812,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     pool.idle_tls.clear();
     pool.active_plain = 0;
     pool.active_tls = 0;
+    pool.connecting_plain = 0;
+    pool.connecting_tls = 0;
     pool.reserved_idle_plain = 0;
     pool.reserved_idle_tls = 0;
   }
@@ -1079,6 +1083,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
                   closed_plain > pool->active_plain ? 0 : pool->active_plain - closed_plain;
               pool->active_tls =
                   closed_tls > pool->active_tls ? 0 : pool->active_tls - closed_tls;
+              pool->connecting_plain = 0;
+              pool->connecting_tls = 0;
               pool->reserved_idle_plain = 0;
               pool->reserved_idle_tls = 0;
               wake_one(pool->wait_plain);
@@ -1279,6 +1285,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     const auto pool_deadline = std::chrono::steady_clock::now() + pool_timeout;
     const auto max_connections =
         std::max<std::size_t>(1, options_.max_connections_per_origin);
+    const auto max_connecting =
+        std::max<std::size_t>(1, options_.max_connecting_per_origin);
     bool woke_from_wait = false;
     bool has_idle_reservation = false;
     for (;;) {
@@ -1305,9 +1313,11 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
         has_idle_reservation = false;
       }
       if (pool->active_plain < max_connections &&
+          pool->connecting_plain < max_connecting &&
           (woke_from_wait ||
            (pool->reserved_idle_plain == 0 && pool->wait_plain.empty()))) {
         ++pool->active_plain;
+        ++pool->connecting_plain;
         ++stats_.h1_idle_miss;
         try {
           auto connect_started = std::chrono::steady_clock::now();
@@ -1321,10 +1331,17 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
           co_await new_conn->stream.async_connect(results, asio::use_awaitable);
           boost::system::error_code option_ec;
           new_conn->stream.socket().set_option(tcp::no_delay(true), option_ec);
+          if (pool->connecting_plain > 0) {
+            --pool->connecting_plain;
+          }
+          wake_one(pool->wait_plain);
           record_timing(stats_.h1_connect, elapsed_us(connect_started));
           record_timing(stats_.h1_acquire, elapsed_us(acquire_started));
           co_return AcquiredConnection{std::move(new_conn), {}, false};
         } catch (...) {
+          if (pool->connecting_plain > 0) {
+            --pool->connecting_plain;
+          }
           if (pool->active_plain > 0) {
             --pool->active_plain;
           }
@@ -1499,6 +1516,8 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     const auto pool_deadline = std::chrono::steady_clock::now() + pool_timeout;
     const auto max_connections =
         std::max<std::size_t>(1, options_.max_connections_per_origin);
+    const auto max_connecting =
+        std::max<std::size_t>(1, options_.max_connecting_per_origin);
     bool woke_from_wait = false;
     bool has_idle_reservation = false;
     for (;;) {
@@ -1525,6 +1544,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
         has_idle_reservation = false;
       }
       if (pool->active_tls >= max_connections ||
+          pool->connecting_tls >= max_connecting ||
           (!woke_from_wait &&
            (pool->reserved_idle_tls > 0 || !pool->wait_tls.empty()))) {
         auto waiter =
@@ -1559,6 +1579,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
         continue;
       }
       ++pool->active_tls;
+      ++pool->connecting_tls;
       ++stats_.h1_idle_miss;
       break;
     }
@@ -1567,11 +1588,18 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       auto connect_started = std::chrono::steady_clock::now();
       auto new_conn = co_await open_tls_connection(pool, url, request,
                                                    connect_timeout);
+      if (pool->connecting_tls > 0) {
+        --pool->connecting_tls;
+      }
+      wake_one(pool->wait_tls);
       ++stats_.h1_conn_created;
       record_timing(stats_.h1_connect, elapsed_us(connect_started));
       record_timing(stats_.h1_acquire, elapsed_us(acquire_started));
       co_return AcquiredConnection{{}, std::move(new_conn), false};
     } catch (...) {
+      if (pool->connecting_tls > 0) {
+        --pool->connecting_tls;
+      }
       if (pool->active_tls > 0) {
         --pool->active_tls;
       }
@@ -1587,9 +1615,13 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     auto acquire_started = std::chrono::steady_clock::now();
     const auto max_connections =
         std::max<std::size_t>(1, options_.max_connections_per_origin);
+    const auto max_connecting =
+        std::max<std::size_t>(1, options_.max_connecting_per_origin);
     const auto pool_deadline = std::chrono::steady_clock::now() + pool_timeout;
     bool has_idle_reservation = false;
-    while ((pool->active_tls >= max_connections && pool->idle_tls.empty()) ||
+    while (((pool->active_tls >= max_connections ||
+             pool->connecting_tls >= max_connecting) &&
+            pool->idle_tls.empty()) ||
            (!has_idle_reservation && pool->reserved_idle_tls > 0)) {
       auto waiter =
           std::make_shared<Waiter>(co_await asio::this_coro::executor);
@@ -1625,6 +1657,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       co_return conn;
     }
     ++pool->active_tls;
+    ++pool->connecting_tls;
     try {
       auto connect_started = std::chrono::steady_clock::now();
       auto conn =
@@ -1655,10 +1688,17 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
           .set_option(tcp::no_delay(true), option_ec);
       co_await conn->stream.async_handshake(asio::ssl::stream_base::client,
                                             asio::use_awaitable);
+      if (pool->connecting_tls > 0) {
+        --pool->connecting_tls;
+      }
+      wake_one(pool->wait_tls);
       record_timing(stats_.h1_connect, elapsed_us(connect_started));
       record_timing(stats_.h1_acquire, elapsed_us(acquire_started));
       co_return conn;
     } catch (...) {
+      if (pool->connecting_tls > 0) {
+        --pool->connecting_tls;
+      }
       if (pool->active_tls > 0) {
         --pool->active_tls;
       }
@@ -1833,11 +1873,26 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
             is_operation_aborted_exception(e)) {
           ++stats_.h1_cancelled;
         }
+        if (conn.reused) {
+          ++stats_.h1_reuse_failed;
+          ++stats_.h1_reconnect_after_idle;
+          Response response;
+          response.error = e.what();
+          response.http_version = 1;
+          response.reused_connection = true;
+          if (request.measure_total_time) {
+            response.total_time_sec =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+                    .count();
+          }
+          co_return response;
+        }
         throw;
       }
       if (cancel_state) {
         cancel_state->tls = nullptr;
       }
+      response.reused_connection = conn.reused;
       if (response.error.empty()) {
         pool->idle_tls.push_back(std::move(conn.tls));
         ++stats_.h1_return_to_idle;
@@ -1894,11 +1949,26 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
           is_operation_aborted_exception(e)) {
         ++stats_.h1_cancelled;
       }
+      if (conn.reused) {
+        ++stats_.h1_reuse_failed;
+        ++stats_.h1_reconnect_after_idle;
+        Response response;
+        response.error = e.what();
+        response.http_version = 1;
+        response.reused_connection = true;
+        if (request.measure_total_time) {
+          response.total_time_sec =
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+                  .count();
+        }
+        co_return response;
+      }
       throw;
     }
     if (cancel_state) {
       cancel_state->plain = nullptr;
     }
+    response.reused_connection = conn.reused;
     if (response.error.empty()) {
       pool->idle_plain.push_back(std::move(conn.plain));
       ++stats_.h1_return_to_idle;

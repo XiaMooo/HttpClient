@@ -74,6 +74,8 @@ public:
     std::uint64_t detect_queue_overflow = 0;
     std::uint64_t detect_overflow_to_h1 = 0;
     std::uint64_t detect_overflow_to_h1_later_h2 = 0;
+    std::uint64_t retry_status = 0;
+    std::uint64_t retry_transport = 0;
     AsioHttpClient::Stats h1_pool;
     H2Client::Stats h2_pool;
   };

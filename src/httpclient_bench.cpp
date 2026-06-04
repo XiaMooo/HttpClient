@@ -168,6 +168,7 @@ struct Args {
   int h2_failure_ttl_sec = 30;
   int h1_shards = 0;
   int h1_max_connections_per_origin = 0;
+  int h1_max_connecting_per_origin = 0;
   int h1_max_origins_per_shard = 4096;
   int h1_origin_idle_ttl_sec = 300;
   int h1_actor_connections_per_origin = 8;
@@ -185,6 +186,7 @@ struct Args {
   bool stripe_h1_origin_shards = false;
   bool disable_lightweight_h1 = false;
   bool h1_actor = false;
+  bool idempotency_key = false;
   httpclient::ProtocolPolicy policy = httpclient::ProtocolPolicy::Auto;
   bool mixed = false;
   bool mixed_shuffle = false;
@@ -227,6 +229,8 @@ Args parse_args(int argc, char** argv) {
       args.h1_shards = std::atoi(argv[++i]);
     } else if (next("--h1-max-connections-per-origin")) {
       args.h1_max_connections_per_origin = std::atoi(argv[++i]);
+    } else if (next("--h1-max-connecting-per-origin")) {
+      args.h1_max_connecting_per_origin = std::atoi(argv[++i]);
     } else if (next("--h1-max-origins-per-shard")) {
       args.h1_max_origins_per_shard = std::atoi(argv[++i]);
     } else if (next("--h1-origin-idle-ttl-sec")) {
@@ -261,6 +265,8 @@ Args parse_args(int argc, char** argv) {
       args.disable_lightweight_h1 = true;
     } else if (s == "--h1-actor") {
       args.h1_actor = true;
+    } else if (s == "--idempotency-key") {
+      args.idempotency_key = true;
     } else if (s == "--force-h1") {
       args.policy = httpclient::ProtocolPolicy::ForceH1;
     } else if (s == "--force-h2") {
@@ -360,6 +366,8 @@ httpclient::HttpClient::Stats diff_stats(
   out.detect_overflow_to_h1 = after.detect_overflow_to_h1 - before.detect_overflow_to_h1;
   out.detect_overflow_to_h1_later_h2 =
       after.detect_overflow_to_h1_later_h2 - before.detect_overflow_to_h1_later_h2;
+  out.retry_status = after.retry_status - before.retry_status;
+  out.retry_transport = after.retry_transport - before.retry_transport;
   out.h1_pool = diff_stats(after.h1_pool, before.h1_pool);
   out.h2_pool.streams_submitted =
       after.h2_pool.streams_submitted - before.h2_pool.streams_submitted;
@@ -434,6 +442,9 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     req.store_response_body = args.store_response;
     req.store_response_headers = args.store_response;
     req.max_retries = args.max_retries;
+    if (args.idempotency_key) {
+      req.set_header("Idempotency-Key", "httpclient-bench");
+    }
     return req;
   };
 
@@ -691,6 +702,8 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
             << " detect_queue_overflow=" << stats.detect_queue_overflow
             << " detect_overflow_to_h1=" << stats.detect_overflow_to_h1
             << " detect_overflow_to_h1_later_h2=" << stats.detect_overflow_to_h1_later_h2
+            << " retry_status=" << stats.retry_status
+            << " retry_transport=" << stats.retry_transport
             << " h1_conn_created=" << stats.h1_pool.h1_conn_created
             << " h1_idle_hit=" << stats.h1_pool.h1_idle_hit
             << " h1_idle_miss=" << stats.h1_pool.h1_idle_miss
@@ -763,6 +776,10 @@ int main(int argc, char** argv) {
   if (args.h1_max_connections_per_origin > 0) {
     options.h1.max_connections_per_origin = static_cast<std::size_t>(
         std::max(1, args.h1_max_connections_per_origin));
+  }
+  if (args.h1_max_connecting_per_origin > 0) {
+    options.h1.max_connecting_per_origin = static_cast<std::size_t>(
+        std::max(1, args.h1_max_connecting_per_origin));
   }
   options.h1.max_origins_per_shard =
       static_cast<std::size_t>(std::max(0, args.h1_max_origins_per_shard));
