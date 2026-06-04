@@ -1466,6 +1466,24 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
     };
   }
 
+  void reset_stats() {
+    stats_.probe_h1_adopted.store(0, std::memory_order_relaxed);
+    stats_.probe_h2_marked.store(0, std::memory_order_relaxed);
+    stats_.probe_reconnect.store(0, std::memory_order_relaxed);
+    stats_.overflow_fallback.store(0, std::memory_order_relaxed);
+    stats_.overflow_fallback_on_h2_origin.store(0, std::memory_order_relaxed);
+    stats_.url_route_cache_hits.store(0, std::memory_order_relaxed);
+    stats_.url_route_cache_misses.store(0, std::memory_order_relaxed);
+    stats_.h1_cached_routes.store(0, std::memory_order_relaxed);
+    stats_.h2_cached_routes.store(0, std::memory_order_relaxed);
+    stats_.detect_waiters.store(0, std::memory_order_relaxed);
+    stats_.detect_queue_overflow.store(0, std::memory_order_relaxed);
+    stats_.detect_overflow_to_h1.store(0, std::memory_order_relaxed);
+    stats_.detect_overflow_to_h1_later_h2.store(0, std::memory_order_relaxed);
+    h1_.reset_stats();
+    h2_.reset_stats();
+  }
+
   using OwnedWork =
       asio::executor_work_guard<asio::io_context::executor_type>;
   std::unique_ptr<asio::io_context> owned_io_;
@@ -1576,6 +1594,10 @@ void HttpClient::shutdown() {
 
 HttpClient::Stats HttpClient::stats() const {
   return impl_->stats();
+}
+
+void HttpClient::reset_stats() {
+  impl_->reset_stats();
 }
 
 asio::awaitable<void> HttpClient::reset_connections() {

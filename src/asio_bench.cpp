@@ -212,6 +212,7 @@ asio::awaitable<void> run_bench(Args args) {
     }
   }
 
+  client.reset_stats();
   auto stats_before = client.stats();
   auto start = std::chrono::steady_clock::now();
   auto ex = co_await asio::this_coro::executor;

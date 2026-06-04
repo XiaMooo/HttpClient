@@ -109,6 +109,7 @@ public:
   Response del(std::string url);
   boost::asio::awaitable<void> preconnect(Request request, std::size_t count);
   Stats stats() const;
+  void reset_stats();
   boost::asio::awaitable<void> reset_connections();
   void shutdown();
 

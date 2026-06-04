@@ -382,6 +382,23 @@ asio::awaitable<void> run(Args args) {
          preconnect_after.h1_pool.h1_conn_created);
   assert(after_preconnect_hit.h1_pool.h1_conn_reused >
          preconnect_after.h1_pool.h1_conn_reused);
+  route_cache_client.reset_stats();
+  auto reset_stats_snapshot = route_cache_client.stats();
+  assert(reset_stats_snapshot.h1_pool.h1_conn_created == 0);
+  assert(reset_stats_snapshot.h1_pool.h1_conn_reused == 0);
+  assert(reset_stats_snapshot.url_route_cache_hits == 0);
+  auto after_reset_hit = httpclient::RequestBuilder::get(args.h1_url)
+                             .insecure()
+                             .no_proxy()
+                             .build();
+  auto after_reset_hit_response =
+      co_await route_cache_client.async_request(std::move(after_reset_hit));
+  assert(after_reset_hit_response.error.empty());
+  assert(after_reset_hit_response.status == 200);
+  auto after_reset_stats = route_cache_client.stats();
+  assert(after_reset_stats.h1_pool.h1_conn_created == 0);
+  assert(after_reset_stats.h1_pool.h1_conn_reused > 0);
+  assert(after_reset_stats.url_route_cache_hits > 0);
 
   httpclient::HttpClient::Options h1_wait_options = options;
   h1_wait_options.h1.max_connections_per_origin = 1;

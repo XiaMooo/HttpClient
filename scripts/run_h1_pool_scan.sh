@@ -156,12 +156,20 @@ cmake --build --preset "$PRESET" --target httpclient_bench -j >/dev/null
 ) >/tmp/httpclient-h1-pool-scan.log 2>&1 &
 pids+=("$!")
 
+server_ready=0
 for _ in $(seq 1 100); do
   if curl -ksS --noproxy '*' "$URL" >/dev/null 2>&1; then
+    server_ready=1
     break
   fi
   sleep 0.05
 done
+if [[ "$server_ready" != "1" ]]; then
+  echo "server did not become ready: $URL" >&2
+  echo "server log:" >&2
+  sed -n '1,120p' /tmp/httpclient-h1-pool-scan.log >&2 || true
+  exit 1
+fi
 
 if [[ -n "$CSV_TARGET" ]]; then
   mkdir -p "$(dirname "$CSV_TARGET")"

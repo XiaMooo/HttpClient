@@ -480,6 +480,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     }
   }
 
+  client.reset_stats();
   auto stats_before = client.stats();
   auto cpu_before = read_process_cpu_stats();
   auto start = std::chrono::steady_clock::now();

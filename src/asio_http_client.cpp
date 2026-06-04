@@ -688,6 +688,33 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     };
   }
 
+  static void reset_timing(AtomicTimingStats& stats) {
+    stats.count.store(0, std::memory_order_relaxed);
+    stats.total_us.store(0, std::memory_order_relaxed);
+    stats.max_us.store(0, std::memory_order_relaxed);
+  }
+
+  void reset_stats() {
+    stats_.h1_conn_created.store(0, std::memory_order_relaxed);
+    stats_.h1_idle_hit.store(0, std::memory_order_relaxed);
+    stats_.h1_idle_miss.store(0, std::memory_order_relaxed);
+    stats_.h1_conn_reused.store(0, std::memory_order_relaxed);
+    stats_.h1_return_to_idle.store(0, std::memory_order_relaxed);
+    stats_.h1_close_after_response.store(0, std::memory_order_relaxed);
+    stats_.h1_reuse_failed.store(0, std::memory_order_relaxed);
+    stats_.h1_reconnect_after_idle.store(0, std::memory_order_relaxed);
+    stats_.h1_cancelled.store(0, std::memory_order_relaxed);
+    stats_.h1_pool_wait_cancelled.store(0, std::memory_order_relaxed);
+    stats_.h1_close_on_cancel.store(0, std::memory_order_relaxed);
+    reset_timing(stats_.h1_pool_wait);
+    reset_timing(stats_.h1_connect);
+    reset_timing(stats_.h1_acquire);
+    reset_timing(stats_.h1_write);
+    reset_timing(stats_.h1_read_headers);
+    reset_timing(stats_.h1_read_body);
+    reset_timing(stats_.h1_exchange);
+  }
+
   H1ExchangeTimings h1_exchange_timings() {
     return H1ExchangeTimings{
         &stats_.h1_write.count,
@@ -2263,6 +2290,10 @@ AsioHttpClient::Stats AsioHttpClient::stats() const {
       Impl::snapshot_timing(impl_->stats_.h1_read_body),
       Impl::snapshot_timing(impl_->stats_.h1_exchange),
   };
+}
+
+void AsioHttpClient::reset_stats() {
+  impl_->reset_stats();
 }
 
 asio::awaitable<void> AsioHttpClient::reset_connections() {

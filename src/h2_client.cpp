@@ -213,6 +213,19 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
            !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {}
   }
 
+  void reset_stats() {
+    stats_.streams_submitted.store(0, std::memory_order_relaxed);
+    stats_.streams_completed.store(0, std::memory_order_relaxed);
+    stats_.streams_timed_out.store(0, std::memory_order_relaxed);
+    stats_.streams_cancelled.store(0, std::memory_order_relaxed);
+    stats_.stream_slot_waits.store(0, std::memory_order_relaxed);
+    stats_.stream_slot_wait_cancelled.store(0, std::memory_order_relaxed);
+    stats_.connect_waits.store(0, std::memory_order_relaxed);
+    stats_.connect_wait_cancelled.store(0, std::memory_order_relaxed);
+    stats_.max_active_streams.store(0, std::memory_order_relaxed);
+    stats_.max_pending_stream_waiters.store(0, std::memory_order_relaxed);
+  }
+
   static std::chrono::milliseconds effective_timeout(
       const Request& request, long Request::Timeout::*field) {
     auto value = request.timeout.*field;
@@ -1955,6 +1968,18 @@ H2Client::Stats H2Client::stats() const {
     }
   }
   return out;
+}
+
+void H2Client::reset_stats() {
+  std::lock_guard<std::mutex> lock(groups_mu_);
+  session_groups_evicted_.store(0, std::memory_order_relaxed);
+  session_group_cache_hits_.store(0, std::memory_order_relaxed);
+  session_group_cache_misses_.store(0, std::memory_order_relaxed);
+  for (auto& [_, group] : groups_) {
+    for (auto& impl : group->impls) {
+      impl->reset_stats();
+    }
+  }
 }
 
 void H2Client::shutdown() {

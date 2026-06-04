@@ -69,6 +69,7 @@ public:
   void async_request_callback(Request request, ResponseHandler handler,
                               bool insecure = false);
   Stats stats() const;
+  void reset_stats();
   boost::asio::awaitable<void> reset_connections();
   void shutdown();
 
