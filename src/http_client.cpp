@@ -1461,6 +1461,31 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
     if (remembered_route(key) == ProtocolState::H1Only) {
       co_return co_await h1_.preconnect(std::move(request), count);
     }
+
+    auto probe = request;
+    probe.method = "GET";
+    probe.body.clear();
+    probe.remove_header("Content-Length");
+    probe.remove_header("Content-Type");
+    probe.store_response_body = false;
+    probe.store_response_headers = false;
+    probe.max_retries = 0;
+    probe.protocol_policy = ProtocolPolicy::Auto;
+    (void)co_await raw_request(std::move(probe));
+
+    cached = CachedRouteProtocol::Unknown;
+    if (lookup_tls_route(this, request.url, options_.origin_cache_ttl,
+                         cache_generation_.load(std::memory_order_acquire), key,
+                         cached)) {
+      if (cached == CachedRouteProtocol::H1Only) {
+        co_return co_await h1_.preconnect(std::move(request), count);
+      }
+      co_return;
+    }
+    key = origin_key(request);
+    if (remembered_route(key) == ProtocolState::H1Only) {
+      co_return co_await h1_.preconnect(std::move(request), count);
+    }
   }
 
   HttpClient::Stats stats() const {
