@@ -389,6 +389,12 @@ httpclient::HttpClient::Stats diff_stats(
       after.h2_pool.connect_waits - before.h2_pool.connect_waits;
   out.h2_pool.connect_wait_cancelled =
       after.h2_pool.connect_wait_cancelled - before.h2_pool.connect_wait_cancelled;
+  out.h2_pool.preconnect_attempts =
+      after.h2_pool.preconnect_attempts - before.h2_pool.preconnect_attempts;
+  out.h2_pool.preconnect_success =
+      after.h2_pool.preconnect_success - before.h2_pool.preconnect_success;
+  out.h2_pool.preconnect_failed =
+      after.h2_pool.preconnect_failed - before.h2_pool.preconnect_failed;
   out.h2_pool.max_active_streams = after.h2_pool.max_active_streams;
   out.h2_pool.max_pending_stream_waiters =
       after.h2_pool.max_pending_stream_waiters;
@@ -487,14 +493,42 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     co_await client.reset_connections();
   }
 
-  if (args.preconnect_per_url > 0) {
+  const auto preconnect_count =
+      args.preconnect_per_url < 0
+          ? static_cast<std::size_t>(
+                std::max(1, std::min(args.concurrency, args.requests)))
+          : static_cast<std::size_t>(std::max(0, args.preconnect_per_url));
+  if (preconnect_count > 0) {
     for (const auto& url : urls) {
       auto req = make_request(url);
-      co_await client.preconnect(std::move(req),
-                                 static_cast<std::size_t>(
-                                     std::max(0, args.preconnect_per_url)));
+      co_await client.preconnect(std::move(req), preconnect_count);
     }
   }
+
+  auto setup_stats = client.stats();
+  std::cout << "setup_preconnect_per_url=" << preconnect_count
+            << " setup_probe_h1_adopted=" << setup_stats.probe_h1_adopted
+            << " setup_probe_h2_marked=" << setup_stats.probe_h2_marked
+            << " setup_probe_reconnect=" << setup_stats.probe_reconnect
+            << " setup_url_route_cache_hits=" << setup_stats.url_route_cache_hits
+            << " setup_url_route_cache_misses=" << setup_stats.url_route_cache_misses
+            << " setup_h1_cached_routes=" << setup_stats.h1_cached_routes
+            << " setup_h2_cached_routes=" << setup_stats.h2_cached_routes
+            << " setup_h1_conn_created="
+            << setup_stats.h1_pool.h1_conn_created
+            << " setup_h1_conn_reused="
+            << setup_stats.h1_pool.h1_conn_reused
+            << " setup_h1_return_to_idle="
+            << setup_stats.h1_pool.h1_return_to_idle
+            << " setup_h2_preconnect_attempts="
+            << setup_stats.h2_pool.preconnect_attempts
+            << " setup_h2_preconnect_success="
+            << setup_stats.h2_pool.preconnect_success
+            << " setup_h2_preconnect_failed="
+            << setup_stats.h2_pool.preconnect_failed
+            << " setup_h2_session_groups="
+            << setup_stats.h2_pool.session_groups
+            << "\n";
 
   client.reset_stats();
   auto stats_before = client.stats();
@@ -789,6 +823,9 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
             << " h2_connect_waits=" << stats.h2_pool.connect_waits
             << " h2_connect_wait_cancelled="
             << stats.h2_pool.connect_wait_cancelled
+            << " h2_preconnect_attempts=" << stats.h2_pool.preconnect_attempts
+            << " h2_preconnect_success=" << stats.h2_pool.preconnect_success
+            << " h2_preconnect_failed=" << stats.h2_pool.preconnect_failed
             << " h2_max_active_streams=" << stats.h2_pool.max_active_streams
             << " h2_max_pending_stream_waiters="
             << stats.h2_pool.max_pending_stream_waiters

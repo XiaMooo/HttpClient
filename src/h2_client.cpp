@@ -1,4 +1,5 @@
 #include "httpclient/h2_client.hpp"
+#include "asyncx/asyncx.hpp"
 #include "proxy_support.hpp"
 
 #include <boost/asio/awaitable.hpp>
@@ -203,6 +204,9 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     std::atomic<std::uint64_t> stream_slot_wait_cancelled{0};
     std::atomic<std::uint64_t> connect_waits{0};
     std::atomic<std::uint64_t> connect_wait_cancelled{0};
+    std::atomic<std::uint64_t> preconnect_attempts{0};
+    std::atomic<std::uint64_t> preconnect_success{0};
+    std::atomic<std::uint64_t> preconnect_failed{0};
     std::atomic<std::uint64_t> max_active_streams{0};
     std::atomic<std::uint64_t> max_pending_stream_waiters{0};
   };
@@ -222,6 +226,9 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     stats_.stream_slot_wait_cancelled.store(0, std::memory_order_relaxed);
     stats_.connect_waits.store(0, std::memory_order_relaxed);
     stats_.connect_wait_cancelled.store(0, std::memory_order_relaxed);
+    stats_.preconnect_attempts.store(0, std::memory_order_relaxed);
+    stats_.preconnect_success.store(0, std::memory_order_relaxed);
+    stats_.preconnect_failed.store(0, std::memory_order_relaxed);
     stats_.max_active_streams.store(0, std::memory_order_relaxed);
     stats_.max_pending_stream_waiters.store(0, std::memory_order_relaxed);
   }
@@ -601,12 +608,34 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
             -> asio::awaitable<void> {
           try {
             auto url = parse_url(request.url);
+            ++self->stats_.preconnect_attempts;
             co_await self->ensure_connected(url, insecure, request);
+            ++self->stats_.preconnect_success;
           } catch (...) {
+            ++self->stats_.preconnect_failed;
           }
           co_return;
         },
         asio::detached);
+  }
+
+  asio::awaitable<void> preconnect_wait(Request request, bool insecure) {
+    auto self = shared_from_this();
+    co_await asio::co_spawn(
+        strand_,
+        [self, request = std::move(request), insecure]() mutable
+            -> asio::awaitable<void> {
+          auto url = parse_url(request.url);
+          ++self->stats_.preconnect_attempts;
+          try {
+            co_await self->ensure_connected(url, insecure, request);
+            ++self->stats_.preconnect_success;
+          } catch (...) {
+            ++self->stats_.preconnect_failed;
+          }
+          co_return;
+        },
+        asio::use_awaitable);
   }
 
   asio::awaitable<Response> request_on_strand(Request request, bool insecure) {
@@ -1915,6 +1944,31 @@ asio::awaitable<Response> H2Client::async_request(Request request, bool insecure
   }
 }
 
+asio::awaitable<void> H2Client::preconnect(Request request, std::size_t count,
+                                           bool insecure) {
+  if (count == 0) {
+    co_return;
+  }
+  auto group = group_for(request);
+  auto target = std::min<std::size_t>(std::max<std::size_t>(1, count),
+                                      group->impls.size());
+  if (options_.auto_shards) {
+    auto current = group->active_impls.load(std::memory_order_relaxed);
+    if (target > current) {
+      group->active_impls.store(target, std::memory_order_relaxed);
+    }
+  }
+  co_await asyncx::for_each_limited(
+      target, target,
+      [&](std::size_t index) -> asio::awaitable<void> {
+        if (index < group->impls.size() && group->impls[index]) {
+          co_await group->impls[index]->preconnect_wait(request, insecure);
+        }
+        co_return;
+      },
+      [](std::size_t, std::monostate) {});
+}
+
 void H2Client::async_request_callback(Request request, ResponseHandler handler,
                                       bool insecure) {
   auto group = group_for(request);
@@ -1953,6 +2007,9 @@ H2Client::Stats H2Client::stats() const {
           impl->stats_.stream_slot_wait_cancelled.load();
       out.connect_waits += impl->stats_.connect_waits.load();
       out.connect_wait_cancelled += impl->stats_.connect_wait_cancelled.load();
+      out.preconnect_attempts += impl->stats_.preconnect_attempts.load();
+      out.preconnect_success += impl->stats_.preconnect_success.load();
+      out.preconnect_failed += impl->stats_.preconnect_failed.load();
       out.max_active_streams =
           std::max<std::uint64_t>(out.max_active_streams,
                                   impl->stats_.max_active_streams.load());

@@ -1441,7 +1441,8 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
         co_return co_await h1_.preconnect(std::move(request), count);
       case ProtocolPolicy::ForceH2:
       case ProtocolPolicy::PreferH2:
-        co_return;
+        co_return co_await h2_.preconnect(std::move(request), count,
+                                          !options_.h2.verify_tls);
       case ProtocolPolicy::Auto:
         break;
     }
@@ -1454,12 +1455,18 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
       if (cached == CachedRouteProtocol::H1Only) {
         co_return co_await h1_.preconnect(std::move(request), count);
       }
-      co_return;
+      co_return co_await h2_.preconnect(std::move(request), count,
+                                        !options_.h2.verify_tls);
     }
 
     key = origin_key(request);
-    if (remembered_route(key) == ProtocolState::H1Only) {
+    auto route = remembered_route(key);
+    if (route == ProtocolState::H1Only) {
       co_return co_await h1_.preconnect(std::move(request), count);
+    }
+    if (route == ProtocolState::H2Available) {
+      co_return co_await h2_.preconnect(std::move(request), count,
+                                        !options_.h2.verify_tls);
     }
 
     auto probe = request;
@@ -1480,11 +1487,17 @@ struct HttpClient::Impl : std::enable_shared_from_this<Impl> {
       if (cached == CachedRouteProtocol::H1Only) {
         co_return co_await h1_.preconnect(std::move(request), count);
       }
-      co_return;
+      co_return co_await h2_.preconnect(std::move(request), count,
+                                        !options_.h2.verify_tls);
     }
     key = origin_key(request);
-    if (remembered_route(key) == ProtocolState::H1Only) {
+    route = remembered_route(key);
+    if (route == ProtocolState::H1Only) {
       co_return co_await h1_.preconnect(std::move(request), count);
+    }
+    if (route == ProtocolState::H2Available) {
+      co_return co_await h2_.preconnect(std::move(request), count,
+                                        !options_.h2.verify_tls);
     }
   }
 

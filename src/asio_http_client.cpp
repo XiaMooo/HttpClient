@@ -2168,6 +2168,14 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
     if (options_.stripe_origins_across_shards) {
       auto shard_limit = shards_.size();
       if (options_.auto_shards) {
+        auto current = active_auto_shards_.load(std::memory_order_relaxed);
+        auto wanted = std::min<std::size_t>(shards_.size(),
+                                            std::max<std::size_t>(1, count));
+        while (wanted > current &&
+               !active_auto_shards_.compare_exchange_weak(
+                   current, wanted, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
         shard_limit = active_auto_shards_.load(std::memory_order_relaxed);
         shard_limit = std::max<std::size_t>(
             1, std::min<std::size_t>(shard_limit, shards_.size()));

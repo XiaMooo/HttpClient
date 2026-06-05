@@ -95,7 +95,7 @@ if [[ "$CONCURRENT_WARMUP" == "1" ]]; then
   warmup_args+=(--concurrent-warmup)
 fi
 preconnect_args=()
-if [[ "$PRECONNECT_PER_URL" -gt 0 ]]; then
+if [[ "$PRECONNECT_PER_URL" -ne 0 ]]; then
   preconnect_args+=(--preconnect-per-url "$PRECONNECT_PER_URL")
 fi
 

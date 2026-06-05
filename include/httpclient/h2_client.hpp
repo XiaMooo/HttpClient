@@ -45,6 +45,9 @@ public:
     std::uint64_t stream_slot_wait_cancelled = 0;
     std::uint64_t connect_waits = 0;
     std::uint64_t connect_wait_cancelled = 0;
+    std::uint64_t preconnect_attempts = 0;
+    std::uint64_t preconnect_success = 0;
+    std::uint64_t preconnect_failed = 0;
     std::uint64_t max_active_streams = 0;
     std::uint64_t max_pending_stream_waiters = 0;
     std::uint64_t peer_max_concurrent_streams = 0;
@@ -65,6 +68,8 @@ public:
   boost::asio::awaitable<Response> get(std::string url, bool insecure = false);
   boost::asio::awaitable<Response> async_request(Request request,
                                                  bool insecure = false);
+  boost::asio::awaitable<void> preconnect(Request request, std::size_t count,
+                                          bool insecure = false);
   using ResponseHandler = std::function<void(Response)>;
   void async_request_callback(Request request, ResponseHandler handler,
                               bool insecure = false);
