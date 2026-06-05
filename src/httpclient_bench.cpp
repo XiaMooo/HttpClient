@@ -496,7 +496,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   const auto preconnect_count =
       args.preconnect_per_url < 0
           ? static_cast<std::size_t>(
-                std::max(1, std::min(args.concurrency, args.requests)))
+                std::max(1, std::min(args.concurrency * 2, args.requests)))
           : static_cast<std::size_t>(std::max(0, args.preconnect_per_url));
   if (preconnect_count > 0) {
     for (const auto& url : urls) {

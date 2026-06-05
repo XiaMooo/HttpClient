@@ -14,6 +14,7 @@ DELAY_MS="${DELAY_MS:-5}"
 RESPONSE_BYTES="${RESPONSE_BYTES:-1024}"
 PROFILE="${PROFILE:-auto}"
 WARMUP_PER_URL="${WARMUP_PER_URL:-512}"
+PRECONNECT_PER_URL="${PRECONNECT_PER_URL:-0}"
 CONCURRENT_WARMUP="${CONCURRENT_WARMUP:-1}"
 STRICT_DETECT="${STRICT_DETECT:-1}"
 H2_SESSIONS="${H2_SESSIONS:-4}"
@@ -81,6 +82,10 @@ run_cpp() {
   if [[ "$CONCURRENT_WARMUP" == "1" ]]; then
     warmup_args+=(--concurrent-warmup)
   fi
+  local preconnect_args=()
+  if [[ "$PRECONNECT_PER_URL" -ne 0 ]]; then
+    preconnect_args+=(--preconnect-per-url "$PRECONNECT_PER_URL")
+  fi
   local strict_args=()
   if [[ "$STRICT_DETECT" == "1" ]]; then
     strict_args+=(--strict-detect)
@@ -117,6 +122,7 @@ run_cpp() {
     "${profile_args[@]}" \
     --warmup-per-url "$WARMUP_PER_URL" \
     "${warmup_args[@]}" \
+    "${preconnect_args[@]}" \
     --insecure --no-proxy \
     "${strict_args[@]}" \
     --h2-sessions "$H2_SESSIONS" \
@@ -293,7 +299,7 @@ if [[ -n "$CSV_FILE" ]]; then
   printf 'axis,value,mode,body,requests,concurrency,wall_ms,p50_us,p95_us,p99_us,cpu_user_ms,cpu_system_ms,cpp_rss_kb,cpp_peak_rss_kb,go_alloc_kb,go_sys_kb,go_heap_alloc_kb,go_stack_inuse_kb,go_gc,h1,h2,h2_slot_waits,h1_cancels\n' >"$CSV_FILE"
 fi
 
-echo "resource_trend_bench preset=$PRESET profile=$PROFILE delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL"
+echo "resource_trend_bench preset=$PRESET profile=$PROFILE delay_ms=$DELAY_MS response_bytes=$RESPONSE_BYTES warmup_per_url=$WARMUP_PER_URL preconnect_per_url=$PRECONNECT_PER_URL"
 echo "h2_sessions=$H2_SESSIONS h2_shards=$H2_SHARDS h2_max_streams=$H2_MAX_STREAMS origin_waiters=$ORIGIN_WAITERS strict_detect=$STRICT_DETECT h1_shards=$H1_SHARDS h1_max_conn=$H1_MAX_CONNECTIONS_PER_ORIGIN stripe_h1_origin_shards=$STRIPE_H1_ORIGIN_SHARDS"
 if [[ -n "$CSV_FILE" ]]; then
   echo "csv_file=$CSV_FILE"
