@@ -159,7 +159,7 @@ struct Args {
   int requests = 16;
   int concurrency = 4;
   int body_bytes = 0;
-  int h2_sessions = 2;
+  int h2_sessions = 0;
   int h2_shards = 0;
   int h2_max_streams = 128;
   int origin_waiters = 32;
@@ -872,8 +872,10 @@ int main(int argc, char** argv) {
   options.h2.verify_tls = !args.insecure;
   options.h2.shard_count =
       static_cast<std::size_t>(std::max(0, args.h2_shards));
-  options.h2.sessions_per_origin =
-      static_cast<std::size_t>(std::max(1, args.h2_sessions));
+  if (args.h2_sessions > 0) {
+    options.h2.sessions_per_origin =
+        static_cast<std::size_t>(std::max(1, args.h2_sessions));
+  }
   options.h2.max_concurrent_streams =
       static_cast<std::size_t>(std::max(1, args.h2_max_streams));
   options.origin_waiter_limit =
