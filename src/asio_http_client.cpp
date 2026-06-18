@@ -2304,7 +2304,6 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
 
   void submit(Request request, AsioHttpClient::ResponseHandler handler) {
     auto start = std::chrono::steady_clock::now();
-    auto inflight = std::make_shared<InflightGuard>(this);
     ParsedUrl url;
     try {
       url = parse_url(request.url);
@@ -2320,6 +2319,7 @@ struct AsioHttpClient::Impl : std::enable_shared_from_this<Impl> {
       return;
     }
 
+    InflightGuard inflight(this);
     auto& shard = pick_request_shard(url);
     auto self = shared_from_this();
     asio::co_spawn(
