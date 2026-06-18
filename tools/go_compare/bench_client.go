@@ -76,13 +76,17 @@ func main() {
 	if mixed && urlAlt != "" {
 		urls = append(urls, urlAlt)
 	}
+	payload := ""
+	if bodyBytes > 0 {
+		payload = strings.Repeat("x", bodyBytes)
+	}
 	for round := 0; round < warmupPerURL; round++ {
 		for _, targetURL := range urls {
 			method := http.MethodGet
 			var body io.Reader
-			if bodyBytes > 0 {
+			if payload != "" {
 				method = http.MethodPost
-				body = strings.NewReader(strings.Repeat("x", bodyBytes))
+				body = strings.NewReader(payload)
 			}
 			req, err := http.NewRequest(method, targetURL, body)
 			if err != nil {
@@ -121,7 +125,7 @@ func main() {
 			for i := 0; i < n; i++ {
 				go func(slot int) {
 					defer wg.Done()
-				results[slot] = doRequest(client, makeTarget(url, urlAlt, mixed, mixedShuffle, base+slot), bodyBytes, idempotencyKey)
+					results[slot] = doRequest(client, makeTarget(url, urlAlt, mixed, mixedShuffle, base+slot), payload, idempotencyKey)
 				}(i)
 			}
 			wg.Wait()
@@ -140,7 +144,7 @@ func main() {
 			go func(id int) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				result := doRequest(client, makeTarget(url, urlAlt, mixed, mixedShuffle, id), bodyBytes, idempotencyKey)
+				result := doRequest(client, makeTarget(url, urlAlt, mixed, mixedShuffle, id), payload, idempotencyKey)
 				latencies[id] = result.latencyUs
 				addResultAtomic(&ok, &fail, &h1, &h2, result)
 			}(i)
@@ -185,13 +189,13 @@ func makeTarget(url string, urlAlt string, mixed bool, mixedShuffle bool, id int
 	return url
 }
 
-func doRequest(client *http.Client, targetURL string, bodyBytes int, idempotencyKey bool) requestResult {
+func doRequest(client *http.Client, targetURL string, payload string, idempotencyKey bool) requestResult {
 	start := time.Now()
 	method := http.MethodGet
 	var body io.Reader
-	if bodyBytes > 0 {
+	if payload != "" {
 		method = http.MethodPost
-		body = strings.NewReader(strings.Repeat("x", bodyBytes))
+		body = strings.NewReader(payload)
 	}
 	req, err := http.NewRequest(method, targetURL, body)
 	if err != nil {
