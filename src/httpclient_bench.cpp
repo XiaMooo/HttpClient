@@ -535,34 +535,6 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   auto cpu_before = read_process_cpu_stats();
   auto start = std::chrono::steady_clock::now();
 
-  auto handle_response = [&, state, done_timer, ex](int id,
-                                                    httpclient::Response resp,
-                                                    std::chrono::steady_clock::time_point started) {
-    if (id >= 0 && id < args.requests) {
-      latencies->record(
-          id, static_cast<std::uint64_t>(
-                  std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - started)
-                      .count()));
-    }
-    if (resp.http_version == 1) {
-      state->h1.fetch_add(1);
-    } else if (resp.http_version == 3) {
-      state->h2.fetch_add(1);
-    }
-    if (resp.error.empty() && resp.status >= 200 && resp.status < 500) {
-      state->ok.fetch_add(1);
-    } else {
-      if (state->fail.load() < 3 && !resp.error.empty()) {
-        std::cerr << "error=" << resp.error << "\n";
-      }
-      state->fail.fetch_add(1);
-    }
-    if (state->completed.fetch_add(1) + 1 == args.requests) {
-      asio::post(ex, [done_timer] { done_timer->cancel(); });
-    }
-  };
-
   auto make_indexed_request = [&](int id) {
     httpclient::Request req = make_request(
         (args.mixed && !args.url_alt.empty())
@@ -585,46 +557,21 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
   };
 
-  auto handle_response_no_timer = [&, state](int id, httpclient::Response resp,
-                                             std::chrono::steady_clock::time_point started) {
-    if (id >= 0 && id < args.requests) {
-      latencies->record(
-          id, static_cast<std::uint64_t>(
-                  std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - started)
-                      .count()));
-    }
-    if (resp.http_version == 1) {
-      state->h1.fetch_add(1);
-    } else if (resp.http_version == 3) {
-      state->h2.fetch_add(1);
-    }
-    if (resp.error.empty() && resp.status >= 200 && resp.status < 500) {
-      state->ok.fetch_add(1);
-    } else {
-      if (state->fail.load() < 3 && !resp.error.empty()) {
-        std::cerr << "error=" << resp.error << "\n";
-      }
-      state->fail.fetch_add(1);
-    }
-    state->completed.fetch_add(1);
-  };
-
   auto handle_response_no_latency = [state](httpclient::Response resp) {
     if (resp.http_version == 1) {
-      state->h1.fetch_add(1);
+      state->h1.fetch_add(1, std::memory_order_relaxed);
     } else if (resp.http_version == 3) {
-      state->h2.fetch_add(1);
+      state->h2.fetch_add(1, std::memory_order_relaxed);
     }
     if (resp.error.empty() && resp.status >= 200 && resp.status < 500) {
-      state->ok.fetch_add(1);
+      state->ok.fetch_add(1, std::memory_order_relaxed);
     } else {
-      if (state->fail.load() < 3 && !resp.error.empty()) {
+      if (state->fail.load(std::memory_order_relaxed) < 3 && !resp.error.empty()) {
         std::cerr << "error=" << resp.error << "\n";
       }
-      state->fail.fetch_add(1);
+      state->fail.fetch_add(1, std::memory_order_relaxed);
     }
-    state->completed.fetch_add(1);
+    state->completed.fetch_add(1, std::memory_order_relaxed);
   };
 
   struct GatherResult {
@@ -632,7 +579,102 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     std::uint64_t latency_us = 0;
   };
 
-  std::shared_ptr<std::function<void()>> callback_issue_one;
+  using Executor = decltype(ex);
+  struct CallbackIssuer : std::enable_shared_from_this<CallbackIssuer> {
+    const Args& args;
+    httpclient::HttpClient& client;
+    std::shared_ptr<State> state;
+    std::shared_ptr<LatencyRecorder> latencies;
+    std::shared_ptr<std::string> payload;
+    std::shared_ptr<asio::steady_timer> done_timer;
+    Executor ex;
+
+    CallbackIssuer(const Args& args, httpclient::HttpClient& client,
+                   std::shared_ptr<State> state,
+                   std::shared_ptr<LatencyRecorder> latencies,
+                   std::shared_ptr<std::string> payload,
+                   std::shared_ptr<asio::steady_timer> done_timer,
+                   Executor ex)
+        : args(args),
+          client(client),
+          state(std::move(state)),
+          latencies(std::move(latencies)),
+          payload(std::move(payload)),
+          done_timer(std::move(done_timer)),
+          ex(std::move(ex)) {}
+
+    httpclient::Request make_request_for_url(const std::string& url) const {
+      httpclient::Request req;
+      req.url = url;
+      req.method = payload->empty() ? "GET" : "POST";
+      req.body = *payload;
+      req.timeout_ms = args.timeout_ms;
+      req.verify_peer = !args.insecure;
+      req.verify_host = !args.insecure;
+      req.disable_proxy = args.no_proxy;
+      req.measure_total_time = false;
+      req.protocol_policy = args.policy;
+      req.store_response_body = args.store_response;
+      req.store_response_headers = args.store_response;
+      req.max_retries = args.max_retries;
+      if (args.idempotency_key) {
+        req.set_header("Idempotency-Key", "httpclient-bench");
+      }
+      return req;
+    }
+
+    httpclient::Request make_indexed_request(int id) const {
+      return make_request_for_url(
+          (args.mixed && !args.url_alt.empty())
+              ? (mixed_uses_alt(id, args.mixed_shuffle) ? args.url_alt : args.url)
+              : args.url);
+    }
+
+    void complete(int id, httpclient::Response resp,
+                  std::chrono::steady_clock::time_point started) {
+      if (id >= 0 && id < args.requests) {
+        latencies->record(
+            id, static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - started)
+                        .count()));
+      }
+      if (resp.http_version == 1) {
+        state->h1.fetch_add(1, std::memory_order_relaxed);
+      } else if (resp.http_version == 3) {
+        state->h2.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (resp.error.empty() && resp.status >= 200 && resp.status < 500) {
+        state->ok.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        if (state->fail.load(std::memory_order_relaxed) < 3 && !resp.error.empty()) {
+          std::cerr << "error=" << resp.error << "\n";
+        }
+        state->fail.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (state->completed.fetch_add(1, std::memory_order_relaxed) + 1 ==
+          args.requests) {
+        asio::post(ex, [timer = done_timer] { timer->cancel(); });
+      }
+    }
+
+    void issue() {
+      auto id = state->issued.fetch_add(1, std::memory_order_relaxed);
+      if (id >= args.requests) {
+        return;
+      }
+      auto req = make_indexed_request(id);
+      auto request_start = std::chrono::steady_clock::now();
+      auto self = this->shared_from_this();
+      client.async_request_callback(
+          std::move(req),
+          [self = std::move(self), id, request_start](httpclient::Response resp) mutable {
+            self->complete(id, std::move(resp), request_start);
+            self->issue();
+          });
+    }
+  };
+
   if (args.gather_mode) {
     co_await asyncx::for_each_limited(
         static_cast<std::size_t>(args.requests),
@@ -665,34 +707,17 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
           handle_response_no_latency(std::move(result.response));
         });
   } else if (!args.awaitable_mode) {
-    callback_issue_one = std::make_shared<std::function<void()>>();
-    std::weak_ptr<std::function<void()>> weak_issue_one = callback_issue_one;
-    *callback_issue_one = [&, state, payload, weak_issue_one, handle_response]() {
-      auto id = state->issued.fetch_add(1);
-      if (id >= args.requests) {
-        return;
-      }
-      auto req = make_indexed_request(id);
-      auto request_start = std::chrono::steady_clock::now();
-      client.async_request_callback(
-          std::move(req),
-          [id, request_start, weak_issue_one,
-           handle_response](httpclient::Response resp) mutable {
-            handle_response(id, std::move(resp), request_start);
-            if (auto issue_one = weak_issue_one.lock()) {
-              (*issue_one)();
-            }
-          });
-    };
+    auto callback_issuer = std::make_shared<CallbackIssuer>(
+        args, client, state, latencies, payload, done_timer, ex);
 
     auto starters = std::min(args.concurrency, args.requests);
     for (int i = 0; i < starters; ++i) {
       asio::co_spawn(
           ex,
-          [smooth_start_delay, callback_issue_one, i, starters]()
+          [smooth_start_delay, callback_issuer, i, starters]()
               -> asio::awaitable<void> {
             co_await smooth_start_delay(i, starters);
-            (*callback_issue_one)();
+            callback_issuer->issue();
             co_return;
           },
           asio::detached);

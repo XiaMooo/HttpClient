@@ -411,6 +411,38 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     waiter->timer.cancel();
   }
 
+  std::size_t state_waiter_pool_limit() const {
+    return std::max<std::size_t>(64, options_.max_concurrent_streams * 2);
+  }
+
+  WaiterPtr acquire_state_waiter() {
+    if (!state_waiter_pool_.empty()) {
+      auto waiter = std::move(state_waiter_pool_.back());
+      state_waiter_pool_.pop_back();
+      waiter->woken = false;
+      waiter->cancelled = false;
+      waiter->timer.cancel();
+      waiter->timer.expires_at(asio::steady_timer::time_point::max());
+      return waiter;
+    }
+    auto waiter = std::make_shared<Waiter>(strand_);
+    waiter->timer.expires_at(asio::steady_timer::time_point::max());
+    return waiter;
+  }
+
+  void release_state_waiter(WaiterPtr waiter) {
+    if (!waiter) {
+      return;
+    }
+    waiter->woken = false;
+    waiter->cancelled = false;
+    waiter->timer.cancel();
+    waiter->timer.expires_at(asio::steady_timer::time_point::max());
+    if (state_waiter_pool_.size() < state_waiter_pool_limit()) {
+      state_waiter_pool_.push_back(std::move(waiter));
+    }
+  }
+
   asio::awaitable<void> ensure_connected(const ParsedUrl& url, bool insecure,
                                          const Request& request) {
     auto proxy = proxy_support::proxy_for_request(request);
@@ -680,8 +712,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       }
 
       if (!state->done) {
-        auto waiter = std::make_shared<Waiter>(strand_);
-        waiter->timer.expires_at(asio::steady_timer::time_point::max());
+        auto waiter = acquire_state_waiter();
         state_waiters_[stream_id] = waiter;
         boost::system::error_code ec;
         co_await waiter->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
@@ -689,8 +720,10 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
         if (ec == asio::error::operation_aborted && !waiter->woken) {
           cancel_stream(stream_id, "h2 stream cancelled");
           slot.release();
+          release_state_waiter(std::move(waiter));
           throw std::runtime_error("h2 stream cancelled");
         }
+        release_state_waiter(std::move(waiter));
       }
       state = find_stream(stream_id);
       if (state == nullptr || !state->done) {
@@ -1603,6 +1636,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   std::vector<uint8_t> pending_write_buffer_;
   WaiterQueue connect_waiters_;
   WaiterQueue stream_waiters_;
+  std::vector<WaiterPtr> state_waiter_pool_;
   std::size_t active_streams_ = 0;
   std::size_t peer_max_concurrent_streams_ = 100;
   bool deadline_timer_armed_ = false;
