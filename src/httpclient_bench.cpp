@@ -483,7 +483,8 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
         total, warmup_concurrency, [&](std::size_t id) -> asio::awaitable<void> {
           auto resp =
               co_await client.async_request(make_request_for_url_index(id % urls.size()));
-          if (!resp.error.empty() && printed.fetch_add(1) < 3) {
+          if (!resp.error.empty() &&
+              printed.fetch_add(1, std::memory_order_relaxed) < 3) {
             std::cerr << "warmup_error=" << resp.error << "\n";
           }
           co_return;
@@ -721,8 +722,9 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     auto issue_loop = [&, state, done_timer,
                        smooth_start_delay](int slot, int slots) -> asio::awaitable<void> {
       co_await smooth_start_delay(slot, slots);
-      for (int id = state->issued.fetch_add(1); id < args.requests;
-           id = state->issued.fetch_add(1)) {
+      for (int id = state->issued.fetch_add(1, std::memory_order_relaxed);
+           id < args.requests;
+           id = state->issued.fetch_add(1, std::memory_order_relaxed)) {
         httpclient::Request req = make_indexed_request(id);
         auto request_start = std::chrono::steady_clock::now();
         auto resp = co_await client.async_request(std::move(req));
@@ -732,19 +734,21 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
                         std::chrono::steady_clock::now() - request_start)
                         .count()));
         if (resp.http_version == 1) {
-          state->h1.fetch_add(1);
+          state->h1.fetch_add(1, std::memory_order_relaxed);
         } else if (resp.http_version == 3) {
-          state->h2.fetch_add(1);
+          state->h2.fetch_add(1, std::memory_order_relaxed);
         }
         if (resp.error.empty() && resp.status >= 200 && resp.status < 500) {
-          state->ok.fetch_add(1);
+          state->ok.fetch_add(1, std::memory_order_relaxed);
         } else {
-          if (state->fail.load() < 3 && !resp.error.empty()) {
+          if (state->fail.load(std::memory_order_relaxed) < 3 &&
+              !resp.error.empty()) {
             std::cerr << "error=" << resp.error << "\n";
           }
-          state->fail.fetch_add(1);
+          state->fail.fetch_add(1, std::memory_order_relaxed);
         }
-        if (state->completed.fetch_add(1) + 1 == args.requests) {
+        if (state->completed.fetch_add(1, std::memory_order_relaxed) + 1 ==
+            args.requests) {
           done_timer->cancel();
         }
       }
@@ -756,7 +760,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     }
   }
 
-  if (state->completed.load() < args.requests) {
+  if (state->completed.load(std::memory_order_relaxed) < args.requests) {
     boost::system::error_code ec;
     co_await done_timer->async_wait(asio::redirect_error(asio::use_awaitable, ec));
   }
@@ -771,8 +775,10 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   const auto cpu_system_ms =
       (cpu_after.system_us - cpu_before.system_us) / 1000;
   std::cout << "requests=" << args.requests << "\n";
-  std::cout << "ok=" << state->ok.load() << " fail=" << state->fail.load()
-            << " h1=" << state->h1.load() << " h2=" << state->h2.load() << "\n";
+  std::cout << "ok=" << state->ok.load(std::memory_order_relaxed)
+            << " fail=" << state->fail.load(std::memory_order_relaxed)
+            << " h1=" << state->h1.load(std::memory_order_relaxed)
+            << " h2=" << state->h2.load(std::memory_order_relaxed) << "\n";
   std::cout << "wall_ms=" << wall_ms << "\n";
   std::cout << "p50_us=" << latency.p50_us << " p95_us=" << latency.p95_us
             << " p99_us=" << latency.p99_us
