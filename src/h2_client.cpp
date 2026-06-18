@@ -107,21 +107,34 @@ bool header_name_equals(std::string_view a, std::string_view b) {
   return true;
 }
 
-std::pair<std::string, std::string> split_header(const std::string& header) {
+std::pair<std::string_view, std::string_view> split_header_view(
+    std::string_view header) {
   auto pos = header.find(':');
-  if (pos == std::string::npos) {
-    return {header, ""};
+  if (pos == std::string_view::npos) {
+    return {header, std::string_view{}};
   }
   auto name = header.substr(0, pos);
   auto value = header.substr(pos + 1);
   while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
-    value.erase(value.begin());
+    value.remove_prefix(1);
   }
-  std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
   return {name, value};
 }
+
+bool has_uppercase_ascii(std::string_view value) {
+  for (char ch : value) {
+    if (ch >= 'A' && ch <= 'Z') {
+      return true;
+    }
+  }
+  return false;
+}
+
+struct H2HeaderView {
+  std::string_view name;
+  std::string_view value;
+  std::string lower_name;
+};
 
 bool h2_skip_header(std::string_view name) {
   return name.empty() || name.front() == ':' || header_name_equals(name, "host") ||
@@ -717,16 +730,26 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       content_length = std::to_string(request.body.size());
     }
 
-    std::vector<std::pair<std::string, std::string>> extra_headers;
+    std::vector<H2HeaderView> extra_headers;
     extra_headers.reserve(request.headers.size());
     bool has_accept = false;
     for (const auto& header : request.headers) {
-      auto [name, value] = split_header(header);
+      auto [name, value] = split_header_view(header);
       if (h2_skip_header(name)) {
         continue;
       }
       has_accept = has_accept || header_name_equals(name, "accept");
-      extra_headers.emplace_back(std::move(name), std::move(value));
+      auto& entry = extra_headers.emplace_back();
+      entry.name = name;
+      entry.value = value;
+      if (has_uppercase_ascii(entry.name)) {
+        entry.lower_name.assign(entry.name);
+        std::transform(entry.lower_name.begin(), entry.lower_name.end(),
+                       entry.lower_name.begin(), [](unsigned char c) {
+                         return static_cast<char>(std::tolower(c));
+                       });
+        entry.name = entry.lower_name;
+      }
     }
 
     const auto max_header_count = 6 + extra_headers.size();
@@ -753,12 +776,12 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     if (!request.body.empty()) {
       push_header(nv("content-length", content_length));
     }
-    for (const auto& [name, value] : extra_headers) {
+    for (const auto& header : extra_headers) {
       push_header(nghttp2_nv{
-          reinterpret_cast<uint8_t*>(const_cast<char*>(name.data())),
-          reinterpret_cast<uint8_t*>(const_cast<char*>(value.data())),
-          name.size(),
-          value.size(),
+          reinterpret_cast<uint8_t*>(const_cast<char*>(header.name.data())),
+          reinterpret_cast<uint8_t*>(const_cast<char*>(header.value.data())),
+          header.name.size(),
+          header.value.size(),
           NGHTTP2_NV_FLAG_NONE,
       });
     }
