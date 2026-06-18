@@ -24,6 +24,7 @@
 #include <openssl/ssl.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cctype>
@@ -38,6 +39,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace httpclient {
 namespace asio = boost::asio;
@@ -294,6 +296,8 @@ std::uint64_t elapsed_us_since(std::chrono::steady_clock::time_point start) {
           .count());
 }
 
+constexpr std::size_t kH1GatherWriteBodyThreshold = 4096;
+
 template <class Stream>
 asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& read_buf,
                                                 std::string& write_buf,
@@ -304,7 +308,9 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
                                                 bool absolute_target = false,
                                                 const H1ExchangeTimings* timings = nullptr) {
   const auto request_body = request.body_view();
-  write_buf.reserve(256 + request_body.size());
+  const bool gather_write_body =
+      request_body.size() > kH1GatherWriteBodyThreshold;
+  write_buf.reserve(256 + (gather_write_body ? 0 : request_body.size()));
   write_buf.clear();
   write_buf.append(request.method.empty() ? "GET" : request.method);
   write_buf.push_back(' ');
@@ -343,7 +349,9 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
     write_buf.append("\r\n");
   }
   write_buf.append("Connection: keep-alive\r\n\r\n");
-  write_buf.append(request_body);
+  if (!gather_write_body) {
+    write_buf.append(request_body);
+  }
 
   auto exchange_started = std::chrono::steady_clock::now();
   auto write_started = exchange_started;
@@ -353,7 +361,15 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
     } else {
       stream.expires_after(write_timeout);
     }
-    co_await asio::async_write(stream, asio::buffer(write_buf), asio::use_awaitable);
+    if (!gather_write_body) {
+      co_await asio::async_write(stream, asio::buffer(write_buf), asio::use_awaitable);
+    } else {
+      std::array<asio::const_buffer, 2> buffers{
+          asio::buffer(write_buf),
+          asio::buffer(request_body),
+      };
+      co_await asio::async_write(stream, buffers, asio::use_awaitable);
+    }
   } catch (const std::exception& e) {
     throw stage_error("h1_write", e);
   }
