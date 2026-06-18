@@ -275,7 +275,22 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     H2Client::ResponseHandler handler;
 
     void reset_for_reuse() {
-      response = Response{};
+      response.status = 0;
+      response.body.clear();
+      response.headers.clear();
+      response.error.clear();
+      response.final_url.clear();
+      response.redirect_count = 0;
+      response.total_time_sec = 0.0;
+      response.namelookup_time_sec = 0.0;
+      response.connect_time_sec = 0.0;
+      response.appconnect_time_sec = 0.0;
+      response.pretransfer_time_sec = 0.0;
+      response.starttransfer_time_sec = 0.0;
+      response.num_connects = 0;
+      response.http_version = 0;
+      response.reused_connection = false;
+      response.primary_ip.clear();
       done = false;
       store_body = true;
       store_headers = true;
@@ -792,6 +807,9 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     ++stats_.streams_submitted;
     state->store_body = request.store_response_body;
     state->store_headers = request.store_response_headers;
+    if (state->store_headers && state->response.headers.capacity() < 8) {
+      state->response.headers.reserve(8);
+    }
     state->on_body_chunk = std::move(request.on_body_chunk);
     const auto now = std::chrono::steady_clock::now();
     auto total_timeout =

@@ -209,6 +209,9 @@ void append_response_headers(Response& response, std::string_view headers) {
     return;
   }
   line_start += 2;
+  if (response.headers.capacity() < 8) {
+    response.headers.reserve(8);
+  }
   while (line_start < headers.size()) {
     auto line_end = headers.find("\r\n", line_start);
     if (line_end == std::string_view::npos || line_end == line_start) {
@@ -519,8 +522,12 @@ asio::awaitable<Response> run_http_exchange(Stream& stream, beast::flat_buffer& 
   response.http_version = res.version() == 11 ? 1 : 0;
   if (request.store_response_headers) {
     for (auto const& field : res.base()) {
-      response.headers.emplace_back(std::string(field.name_string()) + ": " +
-                                    std::string(field.value()));
+      std::string header;
+      header.reserve(field.name_string().size() + field.value().size() + 2);
+      header.append(field.name_string());
+      header.append(": ");
+      header.append(field.value());
+      response.headers.emplace_back(std::move(header));
     }
   }
   if (request.measure_total_time) {
