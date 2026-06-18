@@ -437,7 +437,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     urls.push_back(args.url_alt);
   }
 
-  auto make_request = [&](const std::string& url) {
+  auto make_template_request = [&](const std::string& url) {
     httpclient::Request req;
     req.url = url;
     req.method = payload->empty() ? "GET" : "POST";
@@ -457,6 +457,17 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     return req;
   };
 
+  auto request_templates =
+      std::make_shared<std::vector<httpclient::Request>>();
+  request_templates->reserve(urls.size());
+  for (const auto& url : urls) {
+    request_templates->push_back(make_template_request(url));
+  }
+
+  auto make_request_for_url_index = [&](std::size_t index) {
+    return (*request_templates)[index];
+  };
+
   const bool use_concurrent_warmup =
       args.warmup_per_url > 0 &&
       (args.concurrent_warmup || !args.sequential_warmup);
@@ -470,8 +481,8 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     std::atomic<int> printed = 0;
     co_await asyncx::for_each_limited(
         total, warmup_concurrency, [&](std::size_t id) -> asio::awaitable<void> {
-          auto url = urls[id % urls.size()];
-          auto resp = co_await client.async_request(make_request(url));
+          auto resp =
+              co_await client.async_request(make_request_for_url_index(id % urls.size()));
           if (!resp.error.empty() && printed.fetch_add(1) < 3) {
             std::cerr << "warmup_error=" << resp.error << "\n";
           }
@@ -480,8 +491,9 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
         [](std::size_t, std::monostate) {});
   } else if (args.warmup_per_url > 0 && args.sequential_warmup) {
     for (int round = 0; round < args.warmup_per_url; ++round) {
-      for (const auto& url : urls) {
-        auto resp = co_await client.async_request(make_request(url));
+      for (std::size_t url_index = 0; url_index < urls.size(); ++url_index) {
+        auto resp =
+            co_await client.async_request(make_request_for_url_index(url_index));
         if (!resp.error.empty()) {
           std::cerr << "warmup_error=" << resp.error << "\n";
         }
@@ -499,8 +511,8 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
                 std::max(1, std::min(args.concurrency * 2, args.requests)))
           : static_cast<std::size_t>(std::max(0, args.preconnect_per_url));
   if (preconnect_count > 0) {
-    for (const auto& url : urls) {
-      auto req = make_request(url);
+    for (std::size_t url_index = 0; url_index < urls.size(); ++url_index) {
+      auto req = make_request_for_url_index(url_index);
       co_await client.preconnect(std::move(req), preconnect_count);
     }
   }
@@ -536,11 +548,12 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
   auto start = std::chrono::steady_clock::now();
 
   auto make_indexed_request = [&](int id) {
-    httpclient::Request req = make_request(
-        (args.mixed && !args.url_alt.empty())
-            ? (mixed_uses_alt(id, args.mixed_shuffle) ? args.url_alt : args.url)
-            : args.url);
-    return req;
+    const std::size_t index =
+        (args.mixed && !args.url_alt.empty() &&
+         mixed_uses_alt(id, args.mixed_shuffle))
+            ? std::size_t{1}
+            : std::size_t{0};
+    return make_request_for_url_index(index);
   };
 
   auto smooth_start_delay = [&](int slot, int slots) -> asio::awaitable<void> {
@@ -585,49 +598,31 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     httpclient::HttpClient& client;
     std::shared_ptr<State> state;
     std::shared_ptr<LatencyRecorder> latencies;
-    std::shared_ptr<std::string> payload;
+    std::shared_ptr<const std::vector<httpclient::Request>> request_templates;
     std::shared_ptr<asio::steady_timer> done_timer;
     Executor ex;
 
     CallbackIssuer(const Args& args, httpclient::HttpClient& client,
                    std::shared_ptr<State> state,
                    std::shared_ptr<LatencyRecorder> latencies,
-                   std::shared_ptr<std::string> payload,
+                   std::shared_ptr<const std::vector<httpclient::Request>> request_templates,
                    std::shared_ptr<asio::steady_timer> done_timer,
                    Executor ex)
         : args(args),
           client(client),
           state(std::move(state)),
           latencies(std::move(latencies)),
-          payload(std::move(payload)),
+          request_templates(std::move(request_templates)),
           done_timer(std::move(done_timer)),
           ex(std::move(ex)) {}
 
-    httpclient::Request make_request_for_url(const std::string& url) const {
-      httpclient::Request req;
-      req.url = url;
-      req.method = payload->empty() ? "GET" : "POST";
-      req.body = *payload;
-      req.timeout_ms = args.timeout_ms;
-      req.verify_peer = !args.insecure;
-      req.verify_host = !args.insecure;
-      req.disable_proxy = args.no_proxy;
-      req.measure_total_time = false;
-      req.protocol_policy = args.policy;
-      req.store_response_body = args.store_response;
-      req.store_response_headers = args.store_response;
-      req.max_retries = args.max_retries;
-      if (args.idempotency_key) {
-        req.set_header("Idempotency-Key", "httpclient-bench");
-      }
-      return req;
-    }
-
     httpclient::Request make_indexed_request(int id) const {
-      return make_request_for_url(
-          (args.mixed && !args.url_alt.empty())
-              ? (mixed_uses_alt(id, args.mixed_shuffle) ? args.url_alt : args.url)
-              : args.url);
+      const std::size_t index =
+          (args.mixed && !args.url_alt.empty() &&
+           mixed_uses_alt(id, args.mixed_shuffle))
+              ? std::size_t{1}
+              : std::size_t{0};
+      return (*request_templates)[index];
     }
 
     void complete(int id, httpclient::Response resp,
@@ -708,7 +703,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
         });
   } else if (!args.awaitable_mode) {
     auto callback_issuer = std::make_shared<CallbackIssuer>(
-        args, client, state, latencies, payload, done_timer, ex);
+        args, client, state, latencies, request_templates, done_timer, ex);
 
     auto starters = std::min(args.concurrency, args.requests);
     for (int i = 0; i < starters; ++i) {
@@ -723,15 +718,12 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
           asio::detached);
     }
   } else {
-    auto issue_loop = [&, state, payload, done_timer,
+    auto issue_loop = [&, state, done_timer,
                        smooth_start_delay](int slot, int slots) -> asio::awaitable<void> {
       co_await smooth_start_delay(slot, slots);
       for (int id = state->issued.fetch_add(1); id < args.requests;
            id = state->issued.fetch_add(1)) {
-        httpclient::Request req = make_request(
-            (args.mixed && !args.url_alt.empty())
-                ? (mixed_uses_alt(id, args.mixed_shuffle) ? args.url_alt : args.url)
-                : args.url);
+        httpclient::Request req = make_indexed_request(id);
         auto request_start = std::chrono::steady_clock::now();
         auto resp = co_await client.async_request(std::move(req));
         latencies->record(
