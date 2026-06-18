@@ -309,7 +309,8 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       store_headers = true;
       on_body_chunk = BodyChunkHandler{};
       callback_mode = false;
-      body_source = BodySource{};
+      body_source.body.clear();
+      body_source.offset = 0;
       has_body_source = false;
       deadline = {};
       write_deadline = {};
