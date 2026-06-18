@@ -1,6 +1,7 @@
 #include "httpclient/request.hpp"
 
 #include <cassert>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -109,6 +110,22 @@ int main() {
     assert(!req.verify_peer && !req.verify_host);
     assert(req.disable_proxy);
     assert(!req.store_response_body && !req.store_response_headers);
+  }
+
+  {
+    httpclient::Request req;
+    auto shared = std::make_shared<const std::string>("shared-body");
+    req.set_shared_body(shared);
+    assert(req.has_body());
+    assert(req.body_size() == shared->size());
+    assert(req.body_view() == *shared);
+    auto copied = req;
+    assert(copied.body_view() == "shared-body");
+    copied.body = "local-body";
+    assert(copied.body_view() == "local-body");
+    copied.set_body("owned-body");
+    assert(!copied.shared_body);
+    assert(copied.body_view() == "owned-body");
   }
 
   {

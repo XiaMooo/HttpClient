@@ -303,7 +303,8 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
                                                 std::chrono::milliseconds read_timeout,
                                                 bool absolute_target = false,
                                                 const H1ExchangeTimings* timings = nullptr) {
-  write_buf.reserve(256 + request.body.size());
+  const auto request_body = request.body_view();
+  write_buf.reserve(256 + request_body.size());
   write_buf.clear();
   write_buf.append(request.method.empty() ? "GET" : request.method);
   write_buf.push_back(' ');
@@ -336,13 +337,13 @@ asio::awaitable<Response> run_light_h1_exchange(Stream& stream, std::string& rea
     write_buf.append(value);
     write_buf.append("\r\n");
   }
-  if (!request.body.empty()) {
+  if (!request_body.empty()) {
     write_buf.append("Content-Length: ");
-    write_buf.append(std::to_string(request.body.size()));
+    write_buf.append(std::to_string(request_body.size()));
     write_buf.append("\r\n");
   }
   write_buf.append("Connection: keep-alive\r\n\r\n");
-  write_buf.append(request.body);
+  write_buf.append(request_body);
 
   auto exchange_started = std::chrono::steady_clock::now();
   auto write_started = exchange_started;
@@ -483,7 +484,7 @@ asio::awaitable<Response> run_http_exchange(Stream& stream, beast::flat_buffer& 
       req.set(name, value);
     }
   }
-  req.body() = std::move(request.body);
+  req.body().assign(request.body_view());
   req.prepare_payload();
 
   auto write_started = std::chrono::steady_clock::now();

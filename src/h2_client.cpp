@@ -267,7 +267,15 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
   struct StreamState {
     struct BodySource {
       std::string body;
+      std::shared_ptr<const std::string> shared_body;
       std::size_t offset = 0;
+
+      std::string_view view() const {
+        if (shared_body) {
+          return *shared_body;
+        }
+        return body;
+      }
     };
 
     Response response;
@@ -310,6 +318,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       on_body_chunk = BodyChunkHandler{};
       callback_mode = false;
       body_source.body.clear();
+      body_source.shared_body.reset();
       body_source.offset = 0;
       has_body_source = false;
       deadline = {};
@@ -760,8 +769,9 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     const std::string_view method =
         request.method.empty() ? std::string_view("GET")
                                : std::string_view(request.method);
-    if (!request.body.empty()) {
-      content_length = std::to_string(request.body.size());
+    const auto request_body = request.body_view();
+    if (!request_body.empty()) {
+      content_length = std::to_string(request_body.size());
     }
 
     std::vector<H2HeaderView> extra_headers;
@@ -807,7 +817,7 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
     if (!has_accept) {
       push_header(nv("accept", "*/*"));
     }
-    if (!request.body.empty()) {
+    if (!request_body.empty()) {
       push_header(nv("content-length", content_length));
     }
     for (const auto& header : extra_headers) {
@@ -825,11 +835,17 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
                            ? header_count
                            : heap_headers.size();
 
-    const bool has_body = !request.body.empty();
+    const bool has_body = !request_body.empty();
     int32_t expected_stream_id = nghttp2_session_get_next_stream_id(session_);
     auto* state = &acquire_stream_entry(expected_stream_id).state;
     if (has_body) {
-      state->body_source.body = std::move(request.body);
+      if (request.shared_body) {
+        state->body_source.shared_body = std::move(request.shared_body);
+        state->body_source.body.clear();
+      } else {
+        state->body_source.body = std::move(request.body);
+        state->body_source.shared_body.reset();
+      }
       state->body_source.offset = 0;
       state->has_body_source = true;
     }
@@ -1290,13 +1306,14 @@ struct H2Client::Impl : std::enable_shared_from_this<Impl> {
       *data_flags |= NGHTTP2_DATA_FLAG_EOF;
       return 0;
     }
-    auto remaining = body->body.size() - body->offset;
+    const auto body_view = body->view();
+    auto remaining = body_view.size() - body->offset;
     auto n = std::min(length, remaining);
     if (n > 0) {
-      std::memcpy(buf, body->body.data() + body->offset, n);
+      std::memcpy(buf, body_view.data() + body->offset, n);
       body->offset += n;
     }
-    if (body->offset >= body->body.size()) {
+    if (body->offset >= body_view.size()) {
       *data_flags |= NGHTTP2_DATA_FLAG_EOF;
     }
     return static_cast<ssize_t>(n);

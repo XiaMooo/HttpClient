@@ -102,6 +102,39 @@ std::string base64_encode(std::string_view value) {
 
 }  // namespace
 
+bool Request::has_body() const noexcept {
+  return !body.empty() || (shared_body && !shared_body->empty());
+}
+
+std::size_t Request::body_size() const noexcept {
+  return !body.empty() ? body.size() : (shared_body ? shared_body->size() : 0);
+}
+
+std::string_view Request::body_view() const noexcept {
+  if (!body.empty()) {
+    return body;
+  }
+  if (shared_body) {
+    return *shared_body;
+  }
+  return {};
+}
+
+const char* Request::body_data() const noexcept {
+  auto view = body_view();
+  return view.empty() ? nullptr : view.data();
+}
+
+void Request::set_body(std::string value) {
+  body = std::move(value);
+  shared_body.reset();
+}
+
+void Request::set_shared_body(std::shared_ptr<const std::string> value) {
+  shared_body = std::move(value);
+  body.clear();
+}
+
 void Request::set_header(std::string name, std::string value) {
   remove_header(name);
   add_header(std::move(name), std::move(value));
@@ -226,18 +259,18 @@ RequestBuilder& RequestBuilder::bearer_auth(std::string token) {
 }
 
 RequestBuilder& RequestBuilder::body(std::string body) {
-  request_.body = std::move(body);
+  request_.set_body(std::move(body));
   return *this;
 }
 
 RequestBuilder& RequestBuilder::body(std::string body, std::string content_type) {
-  request_.body = std::move(body);
+  request_.set_body(std::move(body));
   request_.set_content_type(std::move(content_type));
   return *this;
 }
 
 RequestBuilder& RequestBuilder::json(std::string json_text) {
-  request_.body = std::move(json_text);
+  request_.set_body(std::move(json_text));
   request_.set_content_type("application/json");
   return *this;
 }
@@ -248,20 +281,20 @@ RequestBuilder& RequestBuilder::bytes(std::string bytes, std::string content_typ
 
 RequestBuilder& RequestBuilder::form_urlencoded(
     std::initializer_list<std::pair<std::string_view, std::string_view>> fields) {
-  request_.body = httpclient::form_urlencode(fields);
+  request_.set_body(httpclient::form_urlencode(fields));
   request_.set_content_type("application/x-www-form-urlencoded");
   return *this;
 }
 
 RequestBuilder& RequestBuilder::form_urlencoded(const std::vector<FormField>& fields) {
-  request_.body = httpclient::form_urlencode(fields);
+  request_.set_body(httpclient::form_urlencode(fields));
   request_.set_content_type("application/x-www-form-urlencoded");
   return *this;
 }
 
 RequestBuilder& RequestBuilder::multipart(const std::vector<MultipartPart>& parts) {
   auto boundary = make_multipart_boundary();
-  request_.body = multipart_form_data_body(parts, boundary);
+  request_.set_body(multipart_form_data_body(parts, boundary));
   request_.set_content_type("multipart/form-data; boundary=" + boundary);
   return *this;
 }

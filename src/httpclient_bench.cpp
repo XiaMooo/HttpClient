@@ -441,7 +441,7 @@ asio::awaitable<void> run(Args args, httpclient::HttpClient& client) {
     httpclient::Request req;
     req.url = url;
     req.method = payload->empty() ? "GET" : "POST";
-    req.body = *payload;
+    req.set_shared_body(payload);
     req.timeout_ms = args.timeout_ms;
     req.verify_peer = !args.insecure;
     req.verify_host = !args.insecure;

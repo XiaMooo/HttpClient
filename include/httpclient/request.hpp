@@ -5,6 +5,7 @@
 #include <exception>
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,7 @@ struct Request {
   std::string url;
   std::vector<std::string> headers;
   std::string body;
+  std::shared_ptr<const std::string> shared_body;
   long timeout_ms = 5000;
   Timeout timeout;
   bool verify_peer = true;
@@ -62,6 +64,12 @@ struct Request {
   bool use_cookie_jar = true;
   bool auto_decompress = false;
 
+  bool has_body() const noexcept;
+  std::size_t body_size() const noexcept;
+  std::string_view body_view() const noexcept;
+  const char* body_data() const noexcept;
+  void set_body(std::string value);
+  void set_shared_body(std::shared_ptr<const std::string> value);
   void set_header(std::string name, std::string value);
   void add_header(std::string name, std::string value);
   void add_header_line(std::string header);

@@ -427,10 +427,11 @@ struct CurlHttpClient::Impl {
       curl_easy_setopt(easy, CURLOPT_PROXY, "");
     }
 
-    if (!req.body.empty()) {
-      curl_easy_setopt(easy, CURLOPT_POSTFIELDS, req.body.data());
+    const auto request_body = req.body_view();
+    if (!request_body.empty()) {
+      curl_easy_setopt(easy, CURLOPT_POSTFIELDS, request_body.data());
       curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE,
-                       static_cast<long>(req.body.size()));
+                       static_cast<long>(request_body.size()));
     }
 
     if (options_.enable_http2) {
